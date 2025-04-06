@@ -21,9 +21,12 @@ class CombineGraph(Module):
         self.dropout_global = opt.dropout_global
         self.hop = opt.n_iter
         self.sample_num = opt.n_sample
-        self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
-        self.num = trans_to_cuda(torch.Tensor(num)).float()
-
+        if adj_all is not None and num is not None:
+            self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
+            self.num = trans_to_cuda(torch.Tensor(num)).float()
+        else:
+            self.adj_all = None
+            self.num = None
         # Aggregator
         self.local_agg = LocalAggregator(self.dim, self.opt.alpha, dropout=0.0)
         self.global_agg = []
@@ -64,8 +67,10 @@ class CombineGraph(Module):
         # np.random.shuffle(index)
         # index = index[:n_sample]
         # return self.adj_all[target.view(-1)][:, index], self.num[target.view(-1)][:, index]
-        return self.adj_all[target.view(-1)], self.num[target.view(-1)]
-
+        if self.adj_all is not None and self.num is not None:
+            return self.adj_all[target.view(-1)], self.num[target.view(-1)]
+        else:
+            return None, None
     def compute_scores(self, hidden, mask):
         mask = mask.float().unsqueeze(-1)
 
@@ -96,52 +101,55 @@ class CombineGraph(Module):
         h_local = self.local_agg(h, adj, mask_item)
 
         # global
-        item_neighbors = [inputs]
-        weight_neighbors = []
-        support_size = seqs_len
+        # item_neighbors = [inputs]
+        # weight_neighbors = []
+        # support_size = seqs_len
 
-        for i in range(1, self.hop + 1):
-            item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
-            support_size *= self.sample_num
-            item_neighbors.append(item_sample_i.view(batch_size, support_size))
-            weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
+        # for i in range(1, self.hop + 1):
+        #     item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
+        #     support_size *= self.sample_num
+        #     item_neighbors.append(item_sample_i.view(batch_size, support_size))
+        #     weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
 
-        entity_vectors = [self.embedding(i) for i in item_neighbors]
-        weight_vectors = weight_neighbors
+        # entity_vectors = [self.embedding(i) for i in item_neighbors]
+        # weight_vectors = weight_neighbors
 
-        session_info = []
-        item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
+        # session_info = []
+        # item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
         
-        # mean 
-        sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
+        # # mean 
+        # sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
         
-        # sum
-        # sum_item_emb = torch.sum(item_emb, 1)
+        # # sum
+        # # sum_item_emb = torch.sum(item_emb, 1)
         
-        sum_item_emb = sum_item_emb.unsqueeze(-2)
-        for i in range(self.hop):
-            session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
+        # sum_item_emb = sum_item_emb.unsqueeze(-2)
+        # for i in range(self.hop):
+        #     session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
 
-        for n_hop in range(self.hop):
-            entity_vectors_next_iter = []
-            shape = [batch_size, -1, self.sample_num, self.dim]
-            for hop in range(self.hop - n_hop):
-                aggregator = self.global_agg[n_hop]
-                vector = aggregator(self_vectors=entity_vectors[hop],
-                                    neighbor_vector=entity_vectors[hop+1].view(shape),
-                                    masks=None,
-                                    batch_size=batch_size,
-                                    neighbor_weight=weight_vectors[hop].view(batch_size, -1, self.sample_num),
-                                    extra_vector=session_info[hop])
-                entity_vectors_next_iter.append(vector)
-            entity_vectors = entity_vectors_next_iter
+        # for n_hop in range(self.hop):
+        #     entity_vectors_next_iter = []
+        #     shape = [batch_size, -1, self.sample_num, self.dim]
+        #     for hop in range(self.hop - n_hop):
+        #         aggregator = self.global_agg[n_hop]
+        #         vector = aggregator(self_vectors=entity_vectors[hop],
+        #                             neighbor_vector=entity_vectors[hop+1].view(shape),
+        #                             masks=None,
+        #                             batch_size=batch_size,
+        #                             neighbor_weight=weight_vectors[hop].view(batch_size, -1, self.sample_num),
+        #                             extra_vector=session_info[hop])
+        #         entity_vectors_next_iter.append(vector)
+        #     entity_vectors = entity_vectors_next_iter
 
-        h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
+        # h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
 
         # combine
         h_local = F.dropout(h_local, self.dropout_local, training=self.training)
-        h_global = F.dropout(h_global, self.dropout_global, training=self.training)
-        output = h_local + h_global
+        # h_global = F.dropout(h_global, self.dropout_global, training=self.training)
+        # output = h_local + h_global
+
+        # For local only performance testing, Directly use local embeddings as output:
+        output = h_local
 
         return output
 

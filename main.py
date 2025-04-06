@@ -56,6 +56,11 @@ def main():
         opt.n_iter = 1
         opt.dropout_gcn = 0.6
         opt.dropout_local = 0.5
+    elif opt.dataset == 'Amazon':
+        num_node = 94653
+        opt.n_iter = 1
+        opt.dropout_gcn = 0.2     # recommended values (you can adjust later)
+        opt.dropout_local = 0.0
     else:
         num_node = 310
 
@@ -66,13 +71,16 @@ def main():
     else:
         test_data = pickle.load(open('datasets/' + opt.dataset + '/test.txt', 'rb'))
 
-    adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
-    num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
+    # adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
+    # num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     train_data = Data(train_data)
     test_data = Data(test_data)
 
-    adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
-    model = trans_to_cuda(CombineGraph(opt, num_node, adj, num))
+    # adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
+    # model = trans_to_cuda(CombineGraph(opt, num_node, adj, num))
+
+    # Temporary: explicitly without global graph:
+    model = trans_to_cuda(CombineGraph(opt, num_node, None, None))
 
     print(opt)
     start = time.time()
