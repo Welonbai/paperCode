@@ -56,8 +56,8 @@ def main():
         opt.n_iter = 1
         opt.dropout_gcn = 0.6
         opt.dropout_local = 0.5
-    elif opt.dataset == 'Amazon':
-        num_node = 94653
+    elif opt.dataset == 'Amazon_grocery_2018':
+        num_node = 14353
         opt.n_iter = 1
         opt.dropout_gcn = 0.2     # recommended values (you can adjust later)
         opt.dropout_local = 0.0
@@ -78,6 +78,16 @@ def main():
 
     # adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
     # model = trans_to_cuda(CombineGraph(opt, num_node, adj, num))
+
+    print("🔍 Checking max item ID in train and test:")
+    max_train_id = max([max(seq) for seq in train_data.inputs if len(seq) > 0])
+    max_test_id = max([max(seq) for seq in test_data.inputs if len(seq) > 0])
+    print(f"Max item ID in train: {max_train_id}")
+    print(f"Max item ID in test: {max_test_id}")
+    print(f"num_node (embedding size): {num_node}")
+    if max_test_id >= num_node:
+        print("⚠️ Test set has item ID exceeding num_node — this will cause an indexing error!")
+
 
     # Temporary: explicitly without global graph:
     model = trans_to_cuda(CombineGraph(opt, num_node, None, None))
