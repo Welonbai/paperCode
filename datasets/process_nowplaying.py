@@ -162,6 +162,9 @@ def process_seqs(iseqs, idates):
 
 tr_seqs, tr_dates, tr_labs, tr_ids = process_seqs(tra_seqs, tra_dates)
 te_seqs, te_dates, te_labs, te_ids = process_seqs(tes_seqs, tes_dates)
+
+
+
 tra = (tr_seqs, tr_labs)
 tes = (te_seqs, te_labs)
 print('train_test')
