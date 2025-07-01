@@ -243,13 +243,13 @@ import numpy as np
 import torch
 from torch import nn
 from tqdm import tqdm
-from aggregator import LocalAggregator
+from aggregator import LocalAggregator, GlobalAggregator
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 
 class CombineGraph(Module):
-    def __init__(self, opt, num_node, adj_all=None, num=None):
+    def __init__(self, opt, num_node, edge_index=None, features=None):
         super(CombineGraph, self).__init__()
         self.opt = opt
 
@@ -278,6 +278,14 @@ class CombineGraph(Module):
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
 
         self.reset_parameters()
+
+        self.global_graph = (edge_index is not None and features is not None)
+        if self.global_graph:
+            self.global_edge_index = edge_index  # [2, num_edges]
+            self.global_features = features      # [num_nodes, 512]
+            self.linear_image = nn.Linear(512, self.dim)  # To align dimensions
+            self.gcn = GlobalAggregator(self.dim, dropout=opt.dropout_global, act=torch.relu)
+
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.dim)
@@ -310,7 +318,18 @@ class CombineGraph(Module):
         h = self.embedding(inputs)
         h_local = self.local_agg(h, adj, mask_item)
         h_local = F.dropout(h_local, self.dropout_local, training=self.training)
-        return h_local
+
+        if self.global_graph:
+            global_x = self.linear_image(self.global_features.to(inputs.device))  # [num_nodes, dim]
+            global_emb = self.gcn(global_x, self.global_edge_index.to(inputs.device))  # [num_nodes, dim]
+            
+            # Gather global features for input items
+            item_global = global_emb[inputs]  # [batch, len, dim]
+            output = h_local + item_global
+        else:
+            output = h_local
+
+        return output
 
 
 def trans_to_cuda(variable):

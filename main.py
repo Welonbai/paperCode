@@ -1,9 +1,14 @@
 import time
 import argparse
 import pickle
+import os
 from model import *
 from utils import *
 
+def load_image_global_graph(path):
+    with open(path, 'rb') as f:
+        graph = pickle.load(f)
+    return graph
 
 def init_seed(seed=None):
     if seed is None:
@@ -57,7 +62,7 @@ def main():
         opt.dropout_gcn = 0.6
         opt.dropout_local = 0.5
     elif opt.dataset == 'Amazon_grocery_2018':
-        num_node = 14353
+        num_node = 11857
         opt.n_iter = 1
         opt.dropout_gcn = 0.2     # recommended values (you can adjust later)
         opt.dropout_local = 0.0
@@ -70,6 +75,15 @@ def main():
         test_data = valid_data
     else:
         test_data = pickle.load(open('datasets/' + opt.dataset + '/test.txt', 'rb'))
+
+    if opt.dataset == 'Amazon_grocery_2018':
+        global_graph_path = os.path.join('datasets', opt.dataset, 'image_global_graph.pkl')
+        image_graph = load_image_global_graph(global_graph_path)
+        edge_index = image_graph['edge_index']
+        x = image_graph['x']
+    else:
+        edge_index, x = None, None
+
 
     # adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     # num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
@@ -90,7 +104,8 @@ def main():
 
 
     # Temporary: explicitly without global graph:
-    model = trans_to_cuda(CombineGraph(opt, num_node, None, None))
+    model = trans_to_cuda(CombineGraph(opt, num_node, edge_index=edge_index, features=x))
+
 
     print(opt)
     start = time.time()
