@@ -14,10 +14,12 @@ meta_path = os.path.join('datasets/Amazon_grocery_2018', meta_filename)
 output_path = "datasets/Amazon_grocery_2018/"
 time_interval = 60 * 60 * 24
 
+
 def parse(path):
     with open(path, 'rb') as g:
         for l in g:
             yield json.loads(l)
+
 
 def getDF(path):
     data = {}
@@ -28,10 +30,13 @@ def getDF(path):
 # === Step 1: Load metadata and filter valid items with image ===
 print("Loading metadata...")
 valid_items_with_images = set()
+asin_to_url = {}
 for entry in parse(meta_path):
     if 'asin' in entry and 'imageURLHighRes' in entry:
         if isinstance(entry['imageURLHighRes'], list) and len(entry['imageURLHighRes']) > 0:
-            valid_items_with_images.add(entry['asin'])
+            asin = entry['asin']
+            valid_items_with_images.add(asin)
+            asin_to_url[asin] = entry['imageURLHighRes'][0]  # Save first image URL
 
 print(f"✅ Valid items with image: {len(valid_items_with_images)}")
 pickle.dump(valid_items_with_images, open(os.path.join(output_path, 'items_with_image.pkl'), 'wb'))
@@ -87,7 +92,6 @@ session_lengths = [len(seq) for seq in sessions.values()]
 avg_session_len = sum(session_lengths) / len(session_lengths)
 print(f"✅ CoHHN-style session length: {avg_session_len:.2f}")
 
-
 # === Step 7: Train/test split (90/10) ===
 timestamps = interaction.groupby('sessionID')['time'].max()
 sorted_sessions = sorted(timestamps.items(), key=lambda x: x[1])
@@ -140,69 +144,6 @@ for seq, label in zip(te_seqs_raw, te_labs_raw):
         te_seqs.append([old2new_item[i] for i in seq])
         te_labs.append(old2new_item[label])
 
-
-# # === Step 8: Re-index items and prepare (sequence, label) pairs ===
-# item_dict = {}
-# item_ctr = 1
-
-# def reindex_session(sess_dict, train_mode=True):
-#     global item_ctr
-#     new_seqs = []
-#     for s in sess_dict:
-#         outseq = []
-#         for i in sess_dict[s]:
-#             if i in item_dict:
-#                 outseq.append(item_dict[i])
-#             elif train_mode:
-#                 item_dict[i] = item_ctr
-#                 outseq.append(item_ctr)
-#                 item_ctr += 1
-#         if len(outseq) >= 2:
-#             new_seqs.append(outseq)
-#     return new_seqs
-
-# tra_seqs = reindex_session(tra_sess, train_mode=True)
-# tes_seqs = reindex_session(tes_sess, train_mode=False)
-
-# def process_seqs_no(iseqs):
-#     out_seqs, labs = [], []
-#     for seq in iseqs:
-#         if len(seq) < 2:
-#             continue
-#         input_seq = seq[:-1]
-#         label = seq[-1]
-#         if label <= len(item_dict):
-#             out_seqs.append(input_seq)
-#             labs.append(label)
-#     return out_seqs, labs
-
-# tr_seqs, tr_labs = process_seqs_no(tra_seqs)
-# te_seqs, te_labs = process_seqs_no(tes_seqs)
-
-# # === Step 9: Densely re-map items ===
-# all_train_items = set()
-# for seq in tr_seqs:
-#     all_train_items.update(seq)
-# all_train_items.update(tr_labs)
-
-# old2new_item = {}
-# new_id = 1
-# for old_id in sorted(all_train_items):
-#     old2new_item[old_id] = new_id
-#     new_id += 1
-
-# tr_seqs = [[old2new_item[i] for i in seq] for seq in tr_seqs]
-# tr_labs = [old2new_item[l] for l in tr_labs]
-
-# te_seqs_remapped, te_labs_remapped = [], []
-# for seq, label in zip(te_seqs, te_labs):
-#     if all(i in old2new_item for i in seq + [label]):
-#         te_seqs_remapped.append([old2new_item[i] for i in seq])
-#         te_labs_remapped.append(old2new_item[label])
-
-# te_seqs, te_labs = te_seqs_remapped, te_labs_remapped
-
-# === Show sample output ===
 print("After remap, train samples:", len(tr_seqs), ", test samples:", len(te_seqs))
 print('train sequence:', tr_seqs[:5])
 print('train lab:', tr_labs[:5])
@@ -215,7 +156,25 @@ all_interactions = sum(len(seq) for seq in tr_seqs + te_seqs)
 print('#interactions:', all_interactions)
 print('#sessions:', len(tr_seqs) + len(te_seqs))
 print('#items:', len(set(i for seq in tr_seqs for i in seq)))
-# print('sequence average length:', all_interactions / (len(tra_seqs) + len(tes_seqs)))
+
+# === Save mapping directory ===
+mapping_dir = os.path.join(output_path, "mapping")
+os.makedirs(mapping_dir, exist_ok=True)
+
+# === Save id ↔ asin ↔ url
+id_asin_url = []
+for asin, old_id in item2id.items():
+    if old_id in old2new_item:
+        new_id = old2new_item[old_id]
+        if asin in asin_to_url:
+            id_asin_url.append({"id": new_id, "asin": asin, "url": asin_to_url[asin]})
+
+with open(os.path.join(mapping_dir, "id_asin_url.pkl"), 'wb') as f:
+    pickle.dump(id_asin_url, f)
+
+pd.DataFrame(id_asin_url).to_csv(os.path.join(mapping_dir, "id_asin_url.csv"), index=False)
+
+print(f"✅ Saved id_asin_url.pkl and id_asin_url.csv to: {mapping_dir}")
 
 # === Final Save ===
 print("Saving train/test splits...")
