@@ -1,370 +1,280 @@
-# import datetime
-# import math
-# import numpy as np
-# import torch
-# from torch import nn
-# from tqdm import tqdm
-# from aggregator import LocalAggregator, GlobalAggregator
-# from torch.nn import Module, Parameter
-# import torch.nn.functional as F
-
-
-# class CombineGraph(Module):
-#     def __init__(self, opt, num_node, adj_all, num):
-#         super(CombineGraph, self).__init__()
-#         self.opt = opt
-
-#         self.batch_size = opt.batch_size
-#         self.num_node = num_node
-#         self.dim = opt.hiddenSize
-#         self.dropout_local = opt.dropout_local
-#         self.dropout_global = opt.dropout_global
-#         self.hop = opt.n_iter
-#         self.sample_num = opt.n_sample
-#         if adj_all is not None and num is not None:
-#             self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
-#             self.num = trans_to_cuda(torch.Tensor(num)).float()
-#         else:
-#             self.adj_all = None
-#             self.num = None
-#         # Aggregator
-#         self.local_agg = LocalAggregator(self.dim, self.opt.alpha, dropout=0.0)
-#         self.global_agg = []
-#         for i in range(self.hop):
-#             if opt.activate == 'relu':
-#                 agg = GlobalAggregator(self.dim, opt.dropout_gcn, act=torch.relu)
-#             else:
-#                 agg = GlobalAggregator(self.dim, opt.dropout_gcn, act=torch.tanh)
-#             self.add_module('agg_gcn_{}'.format(i), agg)
-#             self.global_agg.append(agg)
-
-#         # Item representation & Position representation
-#         self.embedding = nn.Embedding(num_node, self.dim)
-#         self.pos_embedding = nn.Embedding(200, self.dim)
-
-#         # Parameters
-#         self.w_1 = nn.Parameter(torch.Tensor(2 * self.dim, self.dim))
-#         self.w_2 = nn.Parameter(torch.Tensor(self.dim, 1))
-#         self.glu1 = nn.Linear(self.dim, self.dim)
-#         self.glu2 = nn.Linear(self.dim, self.dim, bias=False)
-#         self.linear_transform = nn.Linear(self.dim, self.dim, bias=False)
-
-#         self.leakyrelu = nn.LeakyReLU(opt.alpha)
-#         self.loss_function = nn.CrossEntropyLoss()
-#         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
-#         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
-
-#         self.reset_parameters()
-
-#     def reset_parameters(self):
-#         stdv = 1.0 / math.sqrt(self.dim)
-#         for weight in self.parameters():
-#             weight.data.uniform_(-stdv, stdv)
-
-#     def sample(self, target, n_sample):
-#         # neighbor = self.adj_all[target.view(-1)]
-#         # index = np.arange(neighbor.shape[1])
-#         # np.random.shuffle(index)
-#         # index = index[:n_sample]
-#         # return self.adj_all[target.view(-1)][:, index], self.num[target.view(-1)][:, index]
-#         if self.adj_all is not None and self.num is not None:
-#             return self.adj_all[target.view(-1)], self.num[target.view(-1)]
-#         else:
-#             return None, None
-#     def compute_scores(self, hidden, mask):
-#         mask = mask.float().unsqueeze(-1)
-
-#         batch_size = hidden.shape[0]
-#         len = hidden.shape[1]
-#         pos_emb = self.pos_embedding.weight[:len]
-#         pos_emb = pos_emb.unsqueeze(0).repeat(batch_size, 1, 1)
-
-#         hs = torch.sum(hidden * mask, -2) / torch.sum(mask, 1)
-#         hs = hs.unsqueeze(-2).repeat(1, len, 1)
-#         nh = torch.matmul(torch.cat([pos_emb, hidden], -1), self.w_1)
-#         nh = torch.tanh(nh)
-#         nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
-#         beta = torch.matmul(nh, self.w_2)
-#         beta = beta * mask
-#         select = torch.sum(beta * hidden, 1)
-
-#         b = self.embedding.weight[1:]  # n_nodes x latent_size
-#         scores = torch.matmul(select, b.transpose(1, 0))
-#         return scores
-
-#     def forward(self, inputs, adj, mask_item, item):
-#         batch_size = inputs.shape[0]
-#         seqs_len = inputs.shape[1]
-#         h = self.embedding(inputs)
-
-#         # local
-#         h_local = self.local_agg(h, adj, mask_item)
-
-#         # global
-#         # item_neighbors = [inputs]
-#         # weight_neighbors = []
-#         # support_size = seqs_len
-
-#         # for i in range(1, self.hop + 1):
-#         #     item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
-#         #     support_size *= self.sample_num
-#         #     item_neighbors.append(item_sample_i.view(batch_size, support_size))
-#         #     weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
-
-#         # entity_vectors = [self.embedding(i) for i in item_neighbors]
-#         # weight_vectors = weight_neighbors
-
-#         # session_info = []
-#         # item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
-        
-#         # # mean 
-#         # sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
-        
-#         # # sum
-#         # # sum_item_emb = torch.sum(item_emb, 1)
-        
-#         # sum_item_emb = sum_item_emb.unsqueeze(-2)
-#         # for i in range(self.hop):
-#         #     session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
-
-#         # for n_hop in range(self.hop):
-#         #     entity_vectors_next_iter = []
-#         #     shape = [batch_size, -1, self.sample_num, self.dim]
-#         #     for hop in range(self.hop - n_hop):
-#         #         aggregator = self.global_agg[n_hop]
-#         #         vector = aggregator(self_vectors=entity_vectors[hop],
-#         #                             neighbor_vector=entity_vectors[hop+1].view(shape),
-#         #                             masks=None,
-#         #                             batch_size=batch_size,
-#         #                             neighbor_weight=weight_vectors[hop].view(batch_size, -1, self.sample_num),
-#         #                             extra_vector=session_info[hop])
-#         #         entity_vectors_next_iter.append(vector)
-#         #     entity_vectors = entity_vectors_next_iter
-
-#         # h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
-
-#         # combine
-#         h_local = F.dropout(h_local, self.dropout_local, training=self.training)
-#         # h_global = F.dropout(h_global, self.dropout_global, training=self.training)
-#         # output = h_local + h_global
-
-#         # For local only performance testing, Directly use local embeddings as output:
-#         output = h_local
-
-#         return output
-
-
-# def trans_to_cuda(variable):
-#     if torch.cuda.is_available():
-#         return variable.cuda()
-#     else:
-#         return variable
-
-
-# def trans_to_cpu(variable):
-#     if torch.cuda.is_available():
-#         return variable.cpu()
-#     else:
-#         return variable
-
-
-# def forward(model, data):
-#     # alias_inputs, adj, items, mask, targets, inputs = data
-#     # alias_inputs = trans_to_cuda(alias_inputs).long()
-#     # items = trans_to_cuda(items).long()
-#     # adj = trans_to_cuda(adj).float()
-#     # mask = trans_to_cuda(mask).long()
-#     # inputs = trans_to_cuda(inputs).long()
-
-#     # hidden = model(items, adj, mask, inputs)
-#     # get = lambda index: hidden[index][alias_inputs[index]]
-#     # seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
-#     # return targets, model.compute_scores(seq_hidden, mask)
-#     alias_inputs, adj, items, mask, targets, inputs = data
-#     alias_inputs = trans_to_cuda(alias_inputs).long()
-#     items = trans_to_cuda(items).long() - 1  # <== shift
-#     adj = trans_to_cuda(adj).float()
-#     mask = trans_to_cuda(mask).long()
-#     inputs = trans_to_cuda(inputs).long() - 1  # <== shift
-
-#     hidden = model(items, adj, mask, inputs)
-#     get = lambda index: hidden[index][alias_inputs[index]]
-#     seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
-#     print("inputs min:", inputs.min().item(), "inputs max:", inputs.max().item())
-#     print("items min:", items.min().item(), "items max:", items.max().item())
-
-#     return targets, model.compute_scores(seq_hidden, mask)
-
-
-
-# def train_test(model, train_data, test_data):
-#     print('start training: ', datetime.datetime.now())
-#     model.train()
-#     total_loss = 0.0
-#     train_loader = torch.utils.data.DataLoader(train_data, num_workers=4, batch_size=model.batch_size,
-#                                                shuffle=True, pin_memory=True)
-#     for data in tqdm(train_loader):
-#         model.optimizer.zero_grad()
-#         targets, scores = forward(model, data)
-#         targets = trans_to_cuda(targets).long()
-#         loss = model.loss_function(scores, targets - 1)
-#         loss.backward()
-#         model.optimizer.step()
-#         total_loss += loss
-#     print('\tLoss:\t%.3f' % total_loss)
-#     model.scheduler.step()
-
-#     print('start predicting: ', datetime.datetime.now())
-#     model.eval()
-#     test_loader = torch.utils.data.DataLoader(test_data, num_workers=4, batch_size=model.batch_size,
-#                                               shuffle=False, pin_memory=True)
-#     result = []
-#     hit, mrr = [], []
-#     for data in test_loader:
-#         targets, scores = forward(model, data)
-#         sub_scores = scores.topk(20)[1]
-#         sub_scores = trans_to_cpu(sub_scores).detach().numpy()
-#         targets = targets.numpy()
-#         for score, target, mask in zip(sub_scores, targets, test_data.mask):
-#             hit.append(np.isin(target - 1, score))
-#             if len(np.where(score == target - 1)[0]) == 0:
-#                 mrr.append(0)
-#             else:
-#                 mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
-
-#     result.append(np.mean(hit) * 100)
-#     result.append(np.mean(mrr) * 100)
-
-#     return result
-
-import datetime
+# model.py
 import math
-import numpy as np
 import torch
 from torch import nn
-from tqdm import tqdm
-from aggregator import LocalAggregator, GlobalAggregator
-from torch.nn import Module, Parameter
 import torch.nn.functional as F
+from aggregator import LocalAggregator, GlobalAggregator
 
 
-class CombineGraph(Module):
+class CombineGraph(nn.Module):
+    """
+    Session-based recommender with optional catalog-level (global) graph.
+
+    Inputs at construction:
+      - num_node: number of items (1..num_node are valid item ids; 0 is padding)
+      - features: [num_node+1, D_raw] global side-info features (row 0 should be zeros)
+      - edge_index: [2, E] global edges (optional; current GlobalAggregator ignores them)
+
+    Dynamic projector:
+      - We infer D_raw from `features.shape[1]` and create nn.Linear(D_raw, hiddenSize).
+      - Works for 384 (category), 512 (image), 896 (image+category), etc.
+    """
+
     def __init__(self, opt, num_node, edge_index=None, features=None):
-        super(CombineGraph, self).__init__()
+        super().__init__()
         self.opt = opt
-
         self.batch_size = opt.batch_size
-        self.num_node = num_node
-        self.dim = opt.hiddenSize
+        self.num_node = num_node                      # number of real items (ids 1..num_node)
+        self.hidden_size = opt.hiddenSize
         self.dropout_local = opt.dropout_local
 
-        # Only local aggregator
-        self.local_agg = LocalAggregator(self.dim, self.opt.alpha, dropout=0.0)
+        # ---------------------------
+        # Local/session branch
+        # ---------------------------
+        self.local_agg = LocalAggregator(self.hidden_size, self.opt.alpha, dropout=0.0)
 
-        # Item & Position Embeddings
-        self.embedding = nn.Embedding(num_node + 1, self.dim)
-        self.pos_embedding = nn.Embedding(200, self.dim)
+        # Item embeddings (1 extra row for padding id=0) and position embeddings
+        self.item_embedding = nn.Embedding(num_node + 1, self.hidden_size)
+        self.pos_embedding = nn.Embedding(200, self.hidden_size)
 
-        # Attention Parameters
-        self.w_1 = nn.Parameter(torch.Tensor(2 * self.dim, self.dim))
-        self.w_2 = nn.Parameter(torch.Tensor(self.dim, 1))
-        self.glu1 = nn.Linear(self.dim, self.dim)
-        self.glu2 = nn.Linear(self.dim, self.dim, bias=False)
-        self.linear_transform = nn.Linear(self.dim, self.dim, bias=False)
+        # Attention / scoring parameters (same formulation as your original code)
+        self.w_1 = nn.Parameter(torch.Tensor(2 * self.hidden_size, self.hidden_size))
+        self.w_2 = nn.Parameter(torch.Tensor(self.hidden_size, 1))
+        self.glu1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.glu2 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.linear_transform = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        self.leakyrelu = nn.LeakyReLU(opt.alpha)
+        self.leakyrelu = nn.LeakyReLU(self.opt.alpha)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
 
-        self.reset_parameters()
+        # ---------------------------
+        # Global/catalog branch (optional)
+        # ---------------------------
+        self.has_global_graph = (edge_index is not None and features is not None)
+        if self.has_global_graph:
+            # Ensure tensors and keep them as buffers so they move with .to(device) and are saved with the model
+            if not torch.is_tensor(features):
+                features = torch.as_tensor(features, dtype=torch.float32)
+            if not torch.is_tensor(edge_index):
+                edge_index = torch.as_tensor(edge_index, dtype=torch.long)
 
-        self.global_graph = (edge_index is not None and features is not None)
-        if self.global_graph:
-            self.global_edge_index = edge_index  # [2, num_edges]
-            self.global_features = features      # [num_nodes, 512]
-            self.linear_image = nn.Linear(512, self.dim)  # To align dimensions
-            self.gcn = GlobalAggregator(self.dim, dropout=opt.dropout_global, act=torch.relu)
+            if features.dim() != 2:
+                raise ValueError(f"[CombineGraph] features must be 2D, got {tuple(features.shape)}")
 
+            if features.size(0) != (num_node + 1):
+                # Not fatal, but very likely an id/padding misalignment.
+                print(
+                    f"⚠️ [CombineGraph] features rows ({features.size(0)}) "
+                    f"!= num_node+1 ({num_node+1}). Check id remapping and padding row 0."
+                )
 
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.dim)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
+            self.register_buffer("global_features_raw", features)     # [N, D_raw]
+            self.register_buffer("global_edge_index", edge_index)     # [2, E] (currently unused in placeholder GCN)
 
-    def compute_scores(self, hidden, mask):
-        mask = mask.float().unsqueeze(-1)
+            # ---- Dynamic projector: D_raw -> hidden_size
+            input_dim_raw = features.size(1)
+            self.global_projector = nn.Linear(input_dim_raw, self.hidden_size)
 
-        batch_size = hidden.shape[0]
-        length = hidden.shape[1]
-        pos_emb = self.pos_embedding.weight[:length]
-        pos_emb = pos_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+            # Placeholder "GCN" that currently ignores edges; safe to replace later with real message passing
+            self.global_gnn = GlobalAggregator(self.hidden_size, dropout=opt.dropout_global, act=torch.relu)
 
-        hs = torch.sum(hidden * mask, -2) / torch.sum(mask, 1, keepdim=True)
-        hs = torch.sum(hidden * mask, dim=1, keepdim=True) / torch.sum(mask, dim=1, keepdim=True)
-        hs = hs.repeat(1, length, 1)
-        nh = torch.matmul(torch.cat([pos_emb, hidden], -1), self.w_1)
+        # Init trainable parameters
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Uniform init similar to the original code."""
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for w in self.parameters():
+            if w.dim() > 1:
+                nn.init.uniform_(w, -stdv, stdv)
+            else:
+                nn.init.uniform_(w, -stdv, stdv)
+
+    # -------------------------------------------------------------------------
+    # Scoring head
+    # -------------------------------------------------------------------------
+    def compute_scores(self, seq_hidden_states: torch.Tensor, seq_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute scores over the item catalog for each sequence in the batch.
+
+        Args:
+          seq_hidden_states: [batch_size, seq_len, hidden_size]
+          seq_mask:          [batch_size, seq_len] (1 for real token, 0 for padding)
+
+        Returns:
+          scores:            [batch_size, num_node] (scores for items 1..num_node)
+        """
+        # Expand mask for broadcasting
+        mask_expanded = seq_mask.float().unsqueeze(-1)                        # [batch_size, seq_len, 1]
+
+        batch_size, seq_len, hidden_size = seq_hidden_states.shape
+
+        # Position embeddings for the current sequence length
+        pos_emb = self.pos_embedding.weight[:seq_len]                         # [seq_len, hidden_size]
+        pos_emb = pos_emb.unsqueeze(0).repeat(batch_size, 1, 1)               # [batch_size, seq_len, hidden_size]
+
+        # Session representation: mean of valid positions
+        sum_hidden = torch.sum(seq_hidden_states * mask_expanded, dim=1, keepdim=True)      # [batch_size, 1, hidden_size]
+        denom = torch.sum(mask_expanded, dim=1, keepdim=True).clamp_min(1e-9)               # avoid div-by-zero
+        session_mean = sum_hidden / denom                                                   # [batch_size, 1, hidden_size]
+        session_mean_tiled = session_mean.repeat(1, seq_len, 1)                             # [batch_size, seq_len, hidden_size]
+
+        # Attention to select an informative position
+        nh = torch.matmul(torch.cat([pos_emb, seq_hidden_states], dim=-1), self.w_1)        # [batch_size, seq_len, hidden_size]
         nh = torch.tanh(nh)
-        nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
-        beta = torch.matmul(nh, self.w_2)
-        beta = beta * mask
-        select = torch.sum(beta * hidden, 1)
+        nh = torch.sigmoid(self.glu1(nh) + self.glu2(session_mean_tiled))
+        attn_weights = torch.matmul(nh, self.w_2)                                           # [batch_size, seq_len, 1]
+        attn_weights = attn_weights * mask_expanded                                         # mask out paddings
+        selected_rep = torch.sum(attn_weights * seq_hidden_states, dim=1)                   # [batch_size, hidden_size]
 
-        b = self.embedding.weight[1:]  # exclude padding index 0
-        scores = torch.matmul(select, b.transpose(1, 0))
+        # Catalog item table (skip padding row 0)
+        item_table = self.item_embedding.weight[1:]                                         # [num_node, hidden_size]
+
+        # Scores over all items (1..num_node)
+        scores = torch.matmul(selected_rep, item_table.transpose(1, 0))                     # [batch_size, num_node]
         return scores
 
-    def forward(self, inputs, adj, mask_item, item):
-        h = self.embedding(inputs)
-        h_local = self.local_agg(h, adj, mask_item)
-        h_local = F.dropout(h_local, self.dropout_local, training=self.training)
+    # -------------------------------------------------------------------------
+    # Forward pass
+    # -------------------------------------------------------------------------
+    def forward(self,
+                inputs: torch.Tensor,        # [batch, n_nodes]   unique-node list for this session (a.k.a. seq_items)
+                local_adj: torch.Tensor,     # [batch, n_nodes, n_nodes]  adjacency over 'inputs'
+                mask_item: torch.Tensor,     # [batch, n_nodes]   1 for real nodes, 0 for padding (aligned with 'inputs')
+                _unused_seq_ids: torch.Tensor  # kept for compatibility with existing Data loader signature
+                ) -> torch.Tensor:
+        """
+        Returns:
+          fused_hidden: [batch_size, n_nodes, hidden_size], aligned with 'inputs'
+        """
+        # ----- Local/session branch (must align with inputs/adj/mask) -----
+        node_emb = self.item_embedding(inputs)                                   # [batch, n_nodes, hidden]
+        local_hidden = self.local_agg(node_emb, local_adj, mask_item)            # [batch, n_nodes, hidden]
+        local_hidden = F.dropout(local_hidden, self.dropout_local, training=self.training)
 
-        if self.global_graph:
-            global_x = self.linear_image(self.global_features.to(inputs.device))  # [num_nodes, dim]
-            global_emb = self.gcn(global_x, self.global_edge_index.to(inputs.device))  # [num_nodes, dim]
-            
-            # Gather global features for input items
-            item_global = global_emb[inputs]  # [batch, len, dim]
-            output = h_local + item_global
+        # ----- Global/catalog branch (optional) -----
+        if self.has_global_graph:
+            # 1) Project raw side-info features to hidden space
+            global_features_proj = self.global_projector(self.global_features_raw.to(inputs.device))  # [N+1, hidden]
+
+            # 2) (Placeholder) "GCN": right now it ignores edges; replace with a real message-passing module later
+            global_node_emb = self.global_gnn(global_features_proj, self.global_edge_index.to(inputs.device))  # [N+1, hidden]
+
+            # 3) Gather per-token global vectors by indexing with the session's unique nodes
+            global_hidden = global_node_emb[inputs]                                # [batch, n_nodes, hidden]
+
+            # 4) Fuse local + global (element-wise sum keeps shapes aligned)
+            fused_hidden = local_hidden + global_hidden
         else:
-            output = h_local
+            fused_hidden = local_hidden
 
-        return output
+        return fused_hidden
 
 
-def trans_to_cuda(variable):
-    return variable.cuda() if torch.cuda.is_available() else variable
+# ---------------------------
+# Utilities (unchanged API)
+# ---------------------------
+def trans_to_cuda(x):
+    return x.cuda() if torch.cuda.is_available() else x
 
-def trans_to_cpu(variable):
-    return variable.cpu() if torch.cuda.is_available() else variable
+def trans_to_cpu(x):
+    return x.cpu() if torch.cuda.is_available() else x
 
-def forward(model, data):
-    alias_inputs, adj, items, mask, targets, inputs = data
-    alias_inputs = trans_to_cuda(alias_inputs).long()
-    items = trans_to_cuda(items).long()
-    adj = trans_to_cuda(adj).float()
-    mask = trans_to_cuda(mask).long()
-    inputs = trans_to_cuda(inputs).long()
 
-    hidden = model(items, adj, mask, inputs)
-    get = lambda index: hidden[index][alias_inputs[index]]
-    seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
-    return targets, model.compute_scores(seq_hidden, mask)
+def forward(model, batch):
+    """
+    Wrapper used by train/test:
+      batch = (alias_inputs, local_adj, seq_items, seq_mask, targets, seq_item_ids)
+
+    Note:
+      - local_adj & seq_mask are built over seq_items (unique-node list).
+      - We must call model with (seq_items, local_adj, seq_mask, seq_item_ids).
+    """
+    alias_inputs, local_adj, seq_items, seq_mask, targets, seq_item_ids = batch
+
+    alias_inputs = trans_to_cuda(alias_inputs).long()   # [batch, n_seq_pos] indices mapping to original order
+    seq_items    = trans_to_cuda(seq_items).long()      # [batch, n_nodes]   unique-node list
+    local_adj    = trans_to_cuda(local_adj).float()     # [batch, n_nodes, n_nodes]
+    seq_mask     = trans_to_cuda(seq_mask).long()       # [batch, n_nodes]
+    seq_item_ids = trans_to_cuda(seq_item_ids).long()   # [batch, n_seq_pos] (kept for signature compatibility)
+
+    # Fused hidden states from the model (ALIGNED WITH seq_items!)
+    hidden_all_positions = model(seq_items, local_adj, seq_mask, seq_item_ids)  # [batch, n_nodes, hidden]
+
+    # Reorder to original (alias) order per sequence
+    def pick_sequence_hidden(idx):
+        return hidden_all_positions[idx][alias_inputs[idx]]                      # [n_seq_pos, hidden]
+
+    batch_indices = torch.arange(len(alias_inputs)).long()
+    seq_hidden_reordered = torch.stack([pick_sequence_hidden(i) for i in batch_indices])  # [batch, n_seq_pos, hidden]
+
+    # Compute catalog scores
+    scores = model.compute_scores(seq_hidden_reordered, seq_mask)
+    return targets, scores
+
 
 def train_test(model, train_data, test_data):
+    import datetime
+    from tqdm import tqdm
+    import numpy as np
+
     print('start training: ', datetime.datetime.now())
     model.train()
     total_loss = 0.0
     train_loader = torch.utils.data.DataLoader(train_data, num_workers=4, batch_size=model.batch_size,
                                                shuffle=True, pin_memory=True)
-    for data in tqdm(train_loader):
+
+    # (your debug blocks remain unchanged)
+    if getattr(model.opt, "debug_sanity", False):
+        sanity_loader = torch.utils.data.DataLoader(
+            train_data, num_workers=0, batch_size=model.batch_size,
+            shuffle=True, pin_memory=False
+        )
+        _b = next(iter(sanity_loader))
+        _, _, _, _, _targets, _ = _b
+        print(f"[DBG] targets min/max: {int(_targets.min())}/{int(_targets.max())}, zeros={( _targets==0 ).sum().item()}")
+        bad_lt1 = (_targets < 1).sum().item()
+        bad_gtN = (_targets > model.num_node).sum().item() if hasattr(model, 'num_node') else 0
+        print(f"[DBG] targets <1: {bad_lt1}, targets > num_node: {bad_gtN}")
+
+        print("[DBG] doing 3 mini-steps on one batch to see if loss drops")
+        micro_loader = torch.utils.data.DataLoader(
+            train_data, num_workers=0, batch_size=model.batch_size,
+            shuffle=True, pin_memory=False
+        )
+        micro_batch = next(iter(micro_loader))
+        last_loss = None
+        for i in range(3):
+            model.optimizer.zero_grad()
+            t, s = forward(model, micro_batch)
+            t = trans_to_cuda(t).long()
+            loss_micro = model.loss_function(s, t - 1)
+            loss_micro.backward()
+            emb_grad = getattr(model.item_embedding, "weight").grad
+            if emb_grad is None:
+                print("[DBG] item_embedding grad is None (unexpected)")
+            else:
+                print("[DBG] item_embedding grad stats:",
+                      "nan%", float(torch.isnan(emb_grad).float().mean().item())*100,
+                      "min", float(emb_grad.min().item()),
+                      "mean", float(emb_grad.mean().item()),
+                      "max", float(emb_grad.max().item()))
+            model.optimizer.step()
+            cur = float(loss_micro.detach().cpu().item())
+            print(f"[DBG] step {i}: loss={cur:.4f}" + ("" if last_loss is None else f"  (Δ={cur-last_loss:+.4f})"))
+            last_loss = cur
+
+    for batch in tqdm(train_loader):
         model.optimizer.zero_grad()
-        targets, scores = forward(model, data)
+        targets, scores = forward(model, batch)
         targets = trans_to_cuda(targets).long()
-        loss = model.loss_function(scores, targets - 1)
+        loss = model.loss_function(scores, targets - 1)  # targets are 1-based; subtract 1 to match [0..num_node-1]
         loss.backward()
         model.optimizer.step()
-        total_loss += loss
+        total_loss += float(loss.detach().cpu().item())
+
     print('\tLoss:\t%.3f' % total_loss)
     model.scheduler.step()
 
@@ -372,21 +282,23 @@ def train_test(model, train_data, test_data):
     model.eval()
     test_loader = torch.utils.data.DataLoader(test_data, num_workers=4, batch_size=model.batch_size,
                                               shuffle=False, pin_memory=True)
-    result = []
-    hit, mrr = [], []
-    for data in test_loader:
-        targets, scores = forward(model, data)
-        sub_scores = scores.topk(20)[1]
-        sub_scores = trans_to_cpu(sub_scores).detach().numpy()
-        targets = targets.numpy()
-        for score, target, mask in zip(sub_scores, targets, test_data.mask):
-            hit.append(np.isin(target - 1, score))
-            if len(np.where(score == target - 1)[0]) == 0:
-                mrr.append(0)
-            else:
-                mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
+    hit_list, mrr_list = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            targets, scores = forward(model, batch)
+            topk_indices = scores.topk(20)[1].detach().cpu().numpy()  # [batch, 20]
+            targets_np = targets.detach().cpu().numpy()
+            for pred_row, tgt in zip(topk_indices, targets_np):
+                tgt_idx = tgt - 1  # convert to 0-based
+                hit = (tgt_idx in pred_row)
+                hit_list.append(hit)
+                if hit:
+                    rank = int((pred_row == tgt_idx).nonzero()[0][0]) + 1
+                    mrr_list.append(1.0 / rank)
+                else:
+                    mrr_list.append(0.0)
 
-    result.append(np.mean(hit) * 100)
-    result.append(np.mean(mrr) * 100)
-
-    return result
+    import numpy as np
+    recall20 = np.mean(hit_list) * 100.0
+    mrr20 = np.mean(mrr_list) * 100.0
+    return [recall20, mrr20]
