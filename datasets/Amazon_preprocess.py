@@ -7,11 +7,11 @@ import json
 print("Starting @ %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
 print("Loading dataset...")
 
-datasets_name = 'Amazon_grocery_2018/Grocery_and_Gourmet_Food'
-meta_filename = 'meta_Grocery_and_Gourmet_Food.json'
+datasets_name = 'Amazon_cellPhone_2018/Cell_Phones_and_Accessories'
+meta_filename = 'meta_Cell_Phones_and_Accessories.json'
 data_path = os.path.join('datasets', datasets_name + '.json')
-meta_path = os.path.join('datasets/Amazon_grocery_2018', meta_filename)
-output_path = "datasets/Amazon_grocery_2018/"
+meta_path = os.path.join('datasets/Amazon_cellPhone_2018', meta_filename)
+output_path = "datasets/Amazon_cellPhone_2018/"
 time_interval = 60 * 60 * 24
 
 
@@ -27,31 +27,58 @@ def getDF(path):
         data[i] = d
     return pd.DataFrame.from_dict(data, orient='index')
 
+def load_interaction_subset(path, valid_asins):
+    data = []
+    for entry in parse(path):
+        asin = entry.get('asin')
+        if asin not in valid_asins:
+            continue
+        reviewer = entry.get('reviewerID')
+        timestamp = entry.get('unixReviewTime')
+        if reviewer and timestamp:
+            data.append({
+                "reviewerID": reviewer,
+                "asin": asin,
+                "unixReviewTime": timestamp
+            })
+    return pd.DataFrame(data)
+
 # === Step 1: Load metadata and filter valid items with image ===
 print("Loading metadata...")
-valid_items_with_images = set()
-asin_to_url = {}
+valid_items_with_images_title_category = set()
+asin_to_info = {}
 for entry in parse(meta_path):
-    if 'asin' in entry and 'imageURLHighRes' in entry:
-        if isinstance(entry['imageURLHighRes'], list) and len(entry['imageURLHighRes']) > 0:
-            asin = entry['asin']
-            valid_items_with_images.add(asin)
-            asin_to_url[asin] = entry['imageURLHighRes'][0]  # Save first image URL
+    asin = entry.get('asin')
+    images = entry.get('imageURLHighRes', [])
+    title = entry.get('title', '').strip()
+    categories = entry.get('categories') or entry.get('category')
 
-print(f"✅ Valid items with image: {len(valid_items_with_images)}")
-pickle.dump(valid_items_with_images, open(os.path.join(output_path, 'items_with_image.pkl'), 'wb'))
+    if not asin:
+        continue
+
+    if (
+        isinstance(images, list) and len(images) > 0 and
+        isinstance(title, str) and title != '' and
+        isinstance(categories, list) and len(categories) > 0
+    ):
+        valid_items_with_images_title_category.add(asin)
+        asin_to_info[asin] = {
+            "url": images[0],
+            "title": title,
+            "category": categories
+        }
 
 # Load review data ===
 print("Loading review data...")
-df = getDF(data_path)
-interaction = df[['reviewerID', 'asin', 'unixReviewTime']].dropna()
-print(f"Total interactions before image filter: {len(interaction)}")
-
-# Keep only interactions with items that have images ===
-valid_items_with_images_df = pd.DataFrame({'asin': list(valid_items_with_images)})
-interaction = pd.merge(interaction, valid_items_with_images_df, how='inner', on='asin')
-print(f"Total interactions after image filter: {len(interaction)}")
-print(f"Interactions removed due to missing images: {df.shape[0] - len(interaction)}")
+# Replace old getDF + df filter with this:
+interaction = load_interaction_subset(data_path, valid_items_with_images_title_category)
+# # Keep only interactions with items that have images ===
+# valid_items_with_images_title_category_df = pd.DataFrame({'asin': list(valid_items_with_images_title_category)})
+# interaction = pd.merge(interaction, valid_items_with_images_title_category_df, how='inner', on='asin')
+# print(f"Total interactions after image filter: {len(interaction)}")
+# print(f"Interactions removed due to missing images: {df.shape[0] - len(interaction)}")
+print(f"✅ Interactions loaded: {len(interaction)}")
+print(f"✅ Unique sessions: {interaction['reviewerID'].nunique()}, unique items: {interaction['asin'].nunique()}")
 
 # Drop sessions with ≤ 1 interaction ===
 session_counts = interaction['reviewerID'].value_counts()
@@ -71,17 +98,19 @@ interaction = interaction[interaction['reviewerID'].isin(sessions_to_keep)]
 
 print("✅ Interaction filtering complete after merging with image metadata.")
 
-# === Step 4: Remap sessionID and itemID ===
+# === Step 4: Remap sessionID ===
 interaction = interaction.rename(columns={'reviewerID': 'sessionID', 'asin': 'itemID', 'unixReviewTime': 'time'})
 session2id = {sid: idx + 1 for idx, sid in enumerate(interaction['sessionID'].unique())}
-item2id = {iid: idx + 1 for idx, iid in enumerate(interaction['itemID'].unique())}
 interaction['sessionID'] = interaction['sessionID'].map(session2id)
-interaction['itemID'] = interaction['itemID'].map(item2id)
 
 # === Step 5: Filter items with at least 10 interactions ===
 item_counts = interaction['itemID'].value_counts()
 items_to_keep = item_counts[item_counts >= 10].index
 interaction = interaction[interaction['itemID'].isin(items_to_keep)]
+
+# Remap itemID after filtering
+item2id = {iid: idx + 1 for idx, iid in enumerate(interaction['itemID'].unique())}
+interaction['itemID'] = interaction['itemID'].map(item2id)
 
 # === Step 6: Group sessions ===
 interaction = interaction.sort_values(['sessionID', 'time'])
@@ -161,20 +190,39 @@ print('#items:', len(set(i for seq in tr_seqs for i in seq)))
 mapping_dir = os.path.join(output_path, "mapping")
 os.makedirs(mapping_dir, exist_ok=True)
 
-# === Save id ↔ asin ↔ url
-id_asin_url = []
-for asin, old_id in item2id.items():
-    if old_id in old2new_item:
-        new_id = old2new_item[old_id]
-        if asin in asin_to_url:
-            id_asin_url.append({"id": new_id, "asin": asin, "url": asin_to_url[asin]})
+# Rebuild old_id_to_asin using final mapping only
+old_id_to_asin = {v: k for k, v in item2id.items()}
+id_asin_info = []
+for old_id, new_id in old2new_item.items():
+    asin = old_id_to_asin.get(old_id)
+    if asin is not None and asin in asin_to_info:
+        info = asin_to_info[asin]
+        id_asin_info.append({
+            "id": new_id,
+            "asin": asin,
+            "url": info["url"],
+            "title": info["title"],
+            "category": info["category"]
+        })
 
-with open(os.path.join(mapping_dir, "id_asin_url.pkl"), 'wb') as f:
-    pickle.dump(id_asin_url, f)
+print(f"🔎 Max item ID in id_asin_info: {max([entry['id'] for entry in id_asin_info])}")
+# Save pickle 
+with open(os.path.join(mapping_dir, "id_asin_info.pkl"), 'wb') as f:
+    pickle.dump(id_asin_info, f)
+print(f"✅ Saved id_asin_info.pkl to: {mapping_dir}")
+# Also save CSV
+df_info = pd.DataFrame(id_asin_info)
+df_info.to_csv(os.path.join(mapping_dir, "id_asin_info.csv"), index=False)
+print(f"✅ Saved id_asin_info.csv to: {mapping_dir}")
 
-pd.DataFrame(id_asin_url).to_csv(os.path.join(mapping_dir, "id_asin_url.csv"), index=False)
 
-print(f"✅ Saved id_asin_url.pkl and id_asin_url.csv to: {mapping_dir}")
+max_train_id = max([max(seq) for seq in tr_seqs if len(seq) > 0] + tr_labs)
+print(f"🔎 Max train item ID (after remap): {max_train_id}")
+print(f"🔎 Number of unique items in train: {len(set(i for seq in tr_seqs for i in seq))}")
+max_test_id = max([max(seq) for seq in te_seqs if len(seq) > 0] + te_labs)
+print(f"🔎 Max test item ID (after remap): {max_test_id}")
+print(f"🔎 Number of unique items in test: {len(set(i for seq in te_seqs for i in seq))}")
+# === Save train/test splits ===
 
 # === Final Save ===
 print("Saving train/test splits...")
