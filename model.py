@@ -13,14 +13,15 @@ class CombineGraph(nn.Module):
     Inputs at construction:
       - num_node: number of items (1..num_node are valid item ids; 0 is padding)
       - features: [num_node+1, D_raw] global side-info features (row 0 should be zeros)
-      - edge_index: [2, E] global edges (optional; current GlobalAggregator ignores them)
+      - edge_index: [2, E] global edges (ids aligned with padded item table)
+      - edge_weight: [E] optional edge strengths (cosine similarity, etc.)
 
     Dynamic projector:
       - We infer D_raw from `features.shape[1]` and create nn.Linear(D_raw, hiddenSize).
       - Works for 384 (category), 512 (image), 896 (image+category), etc.
     """
 
-    def __init__(self, opt, num_node, edge_index=None, features=None):
+    def __init__(self, opt, num_node, edge_index=None, edge_weight=None, features=None):
         super().__init__()
         self.opt = opt
         self.batch_size = opt.batch_size
@@ -59,6 +60,18 @@ class CombineGraph(nn.Module):
                 features = torch.as_tensor(features, dtype=torch.float32)
             if not torch.is_tensor(edge_index):
                 edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+            if edge_index.dim() != 2 or edge_index.size(0) != 2:
+                raise ValueError(f"[CombineGraph] edge_index must have shape [2, E], got {tuple(edge_index.shape)}")
+            if edge_weight is None:
+                edge_weight = torch.ones(edge_index.size(1), dtype=torch.float32)
+            else:
+                if not torch.is_tensor(edge_weight):
+                    edge_weight = torch.as_tensor(edge_weight, dtype=torch.float32)
+                else:
+                    edge_weight = edge_weight.float()
+                edge_weight = edge_weight.view(-1)
+                if edge_weight.size(0) != edge_index.size(1):
+                    raise ValueError(f"[CombineGraph] edge_weight length ({edge_weight.size(0)}) does not match edge_index columns ({edge_index.size(1)})")
 
             if features.dim() != 2:
                 raise ValueError(f"[CombineGraph] features must be 2D, got {tuple(features.shape)}")
@@ -70,15 +83,20 @@ class CombineGraph(nn.Module):
                     f"!= num_node+1 ({num_node+1}). Check id remapping and padding row 0."
                 )
 
-            self.register_buffer("global_features_raw", features)     # [N, D_raw]
-            self.register_buffer("global_edge_index", edge_index)     # [2, E] (currently unused in placeholder GCN)
+            self.register_buffer("global_features_raw", features)     # [N+1, D_raw]
+            self.register_buffer("global_edge_index", edge_index)     # [2, E]
+            self.register_buffer("global_edge_weight", edge_weight)   # [E]
 
             # ---- Dynamic projector: D_raw -> hidden_size
             input_dim_raw = features.size(1)
             self.global_projector = nn.Linear(input_dim_raw, self.hidden_size)
 
-            # Placeholder "GCN" that currently ignores edges; safe to replace later with real message passing
+            # Lightweight message-passing over the catalog graph
             self.global_gnn = GlobalAggregator(self.hidden_size, dropout=opt.dropout_global, act=torch.relu)
+        else:
+            self.global_features_raw = None
+            self.global_edge_index = None
+            self.global_edge_weight = None
 
         # Init trainable parameters
         self._reset_parameters()
@@ -157,10 +175,14 @@ class CombineGraph(nn.Module):
         # ----- Global/catalog branch (optional) -----
         if self.has_global_graph:
             # 1) Project raw side-info features to hidden space
-            global_features_proj = self.global_projector(self.global_features_raw.to(inputs.device))  # [N+1, hidden]
+            global_features_proj = self.global_projector(self.global_features_raw)  # [N+1, hidden]
 
-            # 2) (Placeholder) "GCN": right now it ignores edges; replace with a real message-passing module later
-            global_node_emb = self.global_gnn(global_features_proj, self.global_edge_index.to(inputs.device))  # [N+1, hidden]
+            # 2) Propagate over the catalog graph
+            global_node_emb = self.global_gnn(
+                global_features_proj,
+                self.global_edge_index,
+                self.global_edge_weight,
+            )  # [N+1, hidden]
 
             # 3) Gather per-token global vectors by indexing with the session's unique nodes
             global_hidden = global_node_emb[inputs]                                # [batch, n_nodes, hidden]
