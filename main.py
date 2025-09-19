@@ -22,7 +22,7 @@ def init_seed(seed=None):
 # -----------------------------
 # Debug helpers
 # -----------------------------
-def debug_check_global_graph(x, edge_index, num_node):
+def debug_check_global_graph(x, edge_index, num_node, edge_weight=None):
     print("===== DBG[global graph] =====")
     if x is None:
         print("x=None (no features loaded)")
@@ -34,13 +34,14 @@ def debug_check_global_graph(x, edge_index, num_node):
     print(f"rows == num_node+1? {rows_ok}  ({x.shape[0]} vs {num_node+1})")
     if not np.isfinite(x).all():
         bad = x.size - int(np.isfinite(x).sum())
-        print(f"⚠️ x contains {bad} non-finite values")
+        print(f"??? x contains {bad} non-finite values")
     if edge_index is not None:
         ei = edge_index
         if hasattr(ei, "cpu"):
-            ei = ei
-            try: ei_np = ei.cpu().numpy()
-            except: ei_np = None
+            try:
+                ei_np = ei.cpu().numpy()
+            except Exception:
+                ei_np = None
         else:
             ei_np = ei
         print(f"edge_index.shape={edge_index.shape}")
@@ -48,14 +49,23 @@ def debug_check_global_graph(x, edge_index, num_node):
             vmin, vmax = int(ei_np.min()), int(ei_np.max())
             print(f"edge_index id range: [{vmin}, {vmax}] (expected within 0..{num_node})")
             if vmin < 0 or vmax > num_node:
-                print("⚠️ edge_index contains ids outside [0, num_node]")
-            # degree stats (ignore padding 0)
+                print("??? edge_index contains ids outside [0, num_node]")
             deg = np.bincount(ei_np[0], minlength=num_node+1)
             if deg.size > 1:
                 d = deg[1:]
                 print(f"degree stats over real nodes: min={int(d.min())}, med={float(np.median(d)):.1f}, max={int(d.max())}")
+    if edge_weight is not None:
+        ew = edge_weight
+        if hasattr(ew, "cpu"):
+            try:
+                ew_np = ew.cpu().numpy()
+            except Exception:
+                ew_np = None
+        else:
+            ew_np = ew
+        if ew_np is not None and ew_np.size > 0:
+            print(f"edge_weight stats: min={float(ew_np.min()):.4f}, mean={float(ew_np.mean()):.4f}, max={float(ew_np.max()):.4f}")
     print("=============================")
-
 def debug_check_dataset(train_data, test_data, num_node):
     print("===== DBG[data] =====")
     max_seq_len_train = max((len(s) for s in train_data.inputs if len(s) > 0), default=0)
@@ -172,11 +182,11 @@ def main():
         test_data = pickle.load(open('datasets/' + opt.dataset + '/test.txt', 'rb'))
 
     # ---------------- Load global graph (optional) ----------------
-    edge_index, x, graph_path = None, None, None
+    edge_index, edge_weight, x, graph_path = None, None, None, None
 
     mod_tag = getattr(opt, 'global_graph_mods', '').strip()
     if mod_tag and not opt.disable_global_fusion:
-        gg_name = f'global_graph_dec_{mod_tag}.pkl'
+        gg_name = f'global_graph_{mod_tag}.pkl'
         graph_path = os.path.join('datasets', opt.dataset, 'global_graph', gg_name)
 
         # Backward-compat: fall back to legacy filename/location if new one missing
@@ -189,9 +199,14 @@ def main():
         if graph_path and os.path.exists(graph_path):
             global_graph = load_image_global_graph(graph_path)
             edge_index = global_graph['edge_index']
+            edge_weight = global_graph.get('edge_weight')
+            if edge_weight is None:
+                print('?? Global graph has no edge_weight; defaulting to uniform weights.')
             x = global_graph['x']
             print(f"✅ Using global graph: {graph_path}")
             print(f"   x shape: {x.shape}, edge_index shape: {edge_index.shape}")
+            if edge_weight is not None:
+                print(f'   edge_weight len: {edge_weight.shape if hasattr(edge_weight, "shape") else len(edge_weight)}')
 
             # Correctly interpret "including padding" => items = rows - 1
             gg_rows_with_pad = global_graph.get('meta', {}).get('num_nodes_including_padding', x.shape[0])
@@ -221,7 +236,7 @@ def main():
     test_data = Data(test_data)
     if opt.debug_sanity:
         debug_check_dataset(train_data, test_data, num_node)
-        debug_check_global_graph(x, edge_index, num_node)
+        debug_check_global_graph(x, edge_index, num_node, edge_weight)
 
 
     # adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
@@ -240,8 +255,7 @@ def main():
     else:
         print("✅ CombineGraph will be initialized WITH a global graph.")
 
-    # Temporary: explicitly without global graph:
-    model = trans_to_cuda(CombineGraph(opt, num_node, edge_index=edge_index, features=x))
+    model = trans_to_cuda(CombineGraph(opt, num_node, edge_index=edge_index, edge_weight=edge_weight, features=x))
     print(f"[CombineGraph] has_global_graph={getattr(model, 'has_global_graph', None)}")
     if opt.debug_sanity:
         debug_peek_one_batch(opt, model, train_data, note="train-before-train")
