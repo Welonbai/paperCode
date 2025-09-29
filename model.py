@@ -1,27 +1,40 @@
 # model.py
 import math
+from typing import List
 import torch
 from torch import nn
 import torch.nn.functional as F
 from aggregator import LocalAggregator, GlobalAggregator
 
+class GlobalGraphBranch(nn.Module):
+    def __init__(self, features: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor, hidden_size: int, dropout: float, act=torch.relu, tag: str = ""):
+        super().__init__()
+        self.tag = tag
+        self.register_buffer("features_raw", features)
+        self.register_buffer("edge_index", edge_index)
+        self.register_buffer("edge_weight", edge_weight)
+        input_dim_raw = features.size(1)
+        self.projector = nn.Linear(input_dim_raw, hidden_size)
+        self.aggregator = GlobalAggregator(hidden_size, dropout=dropout, act=act)
+
+    def forward(self) -> torch.Tensor:
+        projected = self.projector(self.features_raw)
+        return self.aggregator(projected, self.edge_index, self.edge_weight)
+
+
 
 class CombineGraph(nn.Module):
     """
-    Session-based recommender with optional catalog-level (global) graph.
+    Session-based recommender with optional catalog-level (global) graphs.
 
     Inputs at construction:
       - num_node: number of items (1..num_node are valid item ids; 0 is padding)
-      - features: [num_node+1, D_raw] global side-info features (row 0 should be zeros)
-      - edge_index: [2, E] global edges (ids aligned with padded item table)
-      - edge_weight: [E] optional edge strengths (cosine similarity, etc.)
-
-    Dynamic projector:
-      - We infer D_raw from `features.shape[1]` and create nn.Linear(D_raw, hiddenSize).
-      - Works for 384 (category), 512 (image), 896 (image+category), etc.
+      - global_graphs: optional iterable/dict describing catalog graphs. Each entry should
+        provide keys `features`, `edge_index`, `edge_weight` (optional), and `tag` (optional).
+      - edge_index / features / edge_weight: legacy single-graph arguments kept for backward compatibility.
     """
 
-    def __init__(self, opt, num_node, edge_index=None, edge_weight=None, features=None):
+    def __init__(self, opt, num_node, global_graphs=None, edge_index=None, edge_weight=None, features=None):
         super().__init__()
         self.opt = opt
         self.batch_size = opt.batch_size
@@ -47,56 +60,71 @@ class CombineGraph(nn.Module):
 
         self.leakyrelu = nn.LeakyReLU(self.opt.alpha)
         self.loss_function = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
 
         # ---------------------------
         # Global/catalog branch (optional)
         # ---------------------------
-        self.has_global_graph = (edge_index is not None and features is not None)
-        if self.has_global_graph:
-            # Ensure tensors and keep them as buffers so they move with .to(device) and are saved with the model
-            if not torch.is_tensor(features):
-                features = torch.as_tensor(features, dtype=torch.float32)
-            if not torch.is_tensor(edge_index):
-                edge_index = torch.as_tensor(edge_index, dtype=torch.long)
-            if edge_index.dim() != 2 or edge_index.size(0) != 2:
-                raise ValueError(f"[CombineGraph] edge_index must have shape [2, E], got {tuple(edge_index.shape)}")
-            if edge_weight is None:
-                edge_weight = torch.ones(edge_index.size(1), dtype=torch.float32)
+        if global_graphs is None:
+            if edge_index is not None and features is not None:
+                global_graphs = [{
+                    'tag': 'legacy',
+                    'edge_index': edge_index,
+                    'edge_weight': edge_weight,
+                    'features': features,
+                }]
             else:
-                if not torch.is_tensor(edge_weight):
-                    edge_weight = torch.as_tensor(edge_weight, dtype=torch.float32)
-                else:
-                    edge_weight = edge_weight.float()
-                edge_weight = edge_weight.view(-1)
-                if edge_weight.size(0) != edge_index.size(1):
-                    raise ValueError(f"[CombineGraph] edge_weight length ({edge_weight.size(0)}) does not match edge_index columns ({edge_index.size(1)})")
+                global_graphs = []
+        elif isinstance(global_graphs, dict):
+            global_graphs = [global_graphs]
 
-            if features.dim() != 2:
-                raise ValueError(f"[CombineGraph] features must be 2D, got {tuple(features.shape)}")
+        self.global_branches = nn.ModuleList()
+        self.global_modalities: List[str] = []
 
-            if features.size(0) != (num_node + 1):
-                # Not fatal, but very likely an id/padding misalignment.
-                print(
-                    f"⚠️ [CombineGraph] features rows ({features.size(0)}) "
-                    f"!= num_node+1 ({num_node+1}). Check id remapping and padding row 0."
-                )
+        for idx, graph in enumerate(global_graphs):
+            tag = graph.get('tag', f'graph{idx}')
+            features_data = graph.get('features')
+            edge_index_data = graph.get('edge_index')
+            edge_weight_data = graph.get('edge_weight')
 
-            self.register_buffer("global_features_raw", features)     # [N+1, D_raw]
-            self.register_buffer("global_edge_index", edge_index)     # [2, E]
-            self.register_buffer("global_edge_weight", edge_weight)   # [E]
+            if features_data is None or edge_index_data is None:
+                print(f"[warn] [CombineGraph] Global graph '{tag}' missing features or edge_index. Skipping.")
+                continue
 
-            # ---- Dynamic projector: D_raw -> hidden_size
-            input_dim_raw = features.size(1)
-            self.global_projector = nn.Linear(input_dim_raw, self.hidden_size)
+            features_tensor = torch.as_tensor(features_data, dtype=torch.float32)
+            edge_index_tensor = torch.as_tensor(edge_index_data, dtype=torch.long)
 
-            # Lightweight message-passing over the catalog graph
-            self.global_gnn = GlobalAggregator(self.hidden_size, dropout=opt.dropout_global, act=torch.relu)
-        else:
-            self.global_features_raw = None
-            self.global_edge_index = None
-            self.global_edge_weight = None
+            if edge_index_tensor.dim() != 2 or edge_index_tensor.size(0) != 2:
+                raise ValueError(f"[CombineGraph] edge_index for '{tag}' must have shape [2, E], got {tuple(edge_index_tensor.shape)}")
+            if features_tensor.dim() != 2:
+                raise ValueError(f"[CombineGraph] features for '{tag}' must be 2D, got {tuple(features_tensor.shape)}")
+            if features_tensor.size(0) != (num_node + 1):
+                print(f"[warn] [CombineGraph] features rows ({features_tensor.size(0)}) != num_node+1 ({num_node+1}) for '{tag}'.")
+
+            if edge_weight_data is None:
+                edge_weight_tensor = torch.ones(edge_index_tensor.size(1), dtype=torch.float32)
+            else:
+                edge_weight_tensor = torch.as_tensor(edge_weight_data, dtype=torch.float32).view(-1)
+                if edge_weight_tensor.size(0) != edge_index_tensor.size(1):
+                    raise ValueError(
+                        f"[CombineGraph] edge_weight length ({edge_weight_tensor.size(0)}) does not match edge_index columns ({edge_index_tensor.size(1)}) for '{tag}'."
+                    )
+
+            branch = GlobalGraphBranch(
+                features_tensor,
+                edge_index_tensor,
+                edge_weight_tensor,
+                self.hidden_size,
+                opt.dropout_global,
+                torch.relu,
+                tag=tag,
+            )
+            self.global_branches.append(branch)
+            self.global_modalities.append(tag)
+
+        self.has_global_graph = len(self.global_branches) > 0
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
 
         # Init trainable parameters
         self._reset_parameters()
@@ -174,21 +202,19 @@ class CombineGraph(nn.Module):
 
         # ----- Global/catalog branch (optional) -----
         if self.has_global_graph:
-            # 1) Project raw side-info features to hidden space
-            global_features_proj = self.global_projector(self.global_features_raw)  # [N+1, hidden]
-
-            # 2) Propagate over the catalog graph
-            global_node_emb = self.global_gnn(
-                global_features_proj,
-                self.global_edge_index,
-                self.global_edge_weight,
-            )  # [N+1, hidden]
-
-            # 3) Gather per-token global vectors by indexing with the session's unique nodes
-            global_hidden = global_node_emb[inputs]                                # [batch, n_nodes, hidden]
-
-            # 4) Fuse local + global (element-wise sum keeps shapes aligned)
-            fused_hidden = local_hidden + global_hidden
+            aggregated_global = None
+            for branch in self.global_branches:
+                global_node_emb = branch()                                  # [N+1, hidden]
+                branch_hidden = global_node_emb[inputs]                     # [batch, n_nodes, hidden]
+                if aggregated_global is None:
+                    aggregated_global = branch_hidden
+                else:
+                    aggregated_global = aggregated_global + branch_hidden
+            if aggregated_global is not None:
+                aggregated_global = aggregated_global / len(self.global_branches)
+                fused_hidden = local_hidden + aggregated_global
+            else:
+                fused_hidden = local_hidden
         else:
             fused_hidden = local_hidden
 
