@@ -288,29 +288,36 @@ def main():
 
 
     print(opt)
+    ks = [5, 10, 20]
+    metric_keys = [f'Recall@{k}' for k in ks] + [f'MRR@{k}' for k in ks]
     start = time.time()
-    best_result = [0, 0]
-    best_epoch = [0, 0]
+    best_result = {key: 0.0 for key in metric_keys}
+    best_epoch = {key: 0 for key in metric_keys}
     bad_counter = 0
 
     for epoch in range(opt.epoch):
         print('-------------------------------------------------------')
         print('epoch: ', epoch)
-        hit, mrr = train_test(model, train_data, test_data)
+        metrics = train_test(model, train_data, test_data)
         flag = 0
-        if hit >= best_result[0]:
-            best_result[0] = hit
-            best_epoch[0] = epoch
-            flag = 1
-        if mrr >= best_result[1]:
-            best_result[1] = mrr
-            best_epoch[1] = epoch
-            flag = 1
+        for key in metric_keys:
+            value = metrics.get(key, float('nan'))
+            if value >= best_result.get(key, float('-inf')):
+                best_result[key] = value
+                best_epoch[key] = epoch
+                flag = 1
         print('Current Result:')
-        print('\tRecall@20:\t%.4f\tMMR@20:\t%.4f' % (hit, mrr))
+        for k in ks:
+            recall_k = metrics.get(f'Recall@{k}', float('nan'))
+            mrr_k = metrics.get(f'MRR@{k}', float('nan'))
+            print('\tRecall@{}:	{:.4f}\tMRR@{}:	{:.4f}'.format(k, recall_k, k, mrr_k))
         print('Best Result:')
-        print('\tRecall@20:\t%.4f\tMMR@20:\t%.4f\tEpoch:\t%d,\t%d' % (
-            best_result[0], best_result[1], best_epoch[0], best_epoch[1]))
+        for k in ks:
+            best_recall = best_result.get(f'Recall@{k}', float('nan'))
+            best_mrr = best_result.get(f'MRR@{k}', float('nan'))
+            epoch_recall = best_epoch.get(f'Recall@{k}', 0)
+            epoch_mrr = best_epoch.get(f'MRR@{k}', 0)
+            print('\tRecall@{}:	{:.4f}	Epoch:	{}	MRR@{}:	{:.4f}	Epoch:	{}'.format(k, best_recall, epoch_recall, k, best_mrr, epoch_mrr))
         bad_counter += 1 - flag
         if bad_counter >= opt.patience:
             break

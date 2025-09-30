@@ -1,4 +1,4 @@
-# model.py
+﻿# model.py
 import math
 from typing import List
 import torch
@@ -330,23 +330,29 @@ def train_test(model, train_data, test_data):
     model.eval()
     test_loader = torch.utils.data.DataLoader(test_data, num_workers=4, batch_size=model.batch_size,
                                               shuffle=False, pin_memory=True)
-    hit_list, mrr_list = [], []
+    ks = [5, 10, 20]
+    hits_per_k = {k: [] for k in ks}
+    mrr_per_k = {k: [] for k in ks}
+    max_k = max(ks)
     with torch.no_grad():
         for batch in test_loader:
             targets, scores = forward(model, batch)
-            topk_indices = scores.topk(20)[1].detach().cpu().numpy()  # [batch, 20]
-            targets_np = targets.detach().cpu().numpy()
-            for pred_row, tgt in zip(topk_indices, targets_np):
-                tgt_idx = tgt - 1  # convert to 0-based
-                hit = (tgt_idx in pred_row)
-                hit_list.append(hit)
-                if hit:
-                    rank = int((pred_row == tgt_idx).nonzero()[0][0]) + 1
-                    mrr_list.append(1.0 / rank)
-                else:
-                    mrr_list.append(0.0)
+            topk_indices = scores.topk(max_k)[1].detach().cpu().numpy()  # [batch, max_k]
+            targets_np = targets.detach().cpu().numpy() - 1  # convert to 0-based once
+            for pred_row, tgt_idx in zip(topk_indices, targets_np):
+                for k in ks:
+                    candidate_row = pred_row[:k]
+                    hit = tgt_idx in candidate_row
+                    hits_per_k[k].append(hit)
+                    if hit:
+                        rank = int(np.where(candidate_row == tgt_idx)[0][0]) + 1
+                        mrr_per_k[k].append(1.0 / rank)
+                    else:
+                        mrr_per_k[k].append(0.0)
 
-    import numpy as np
-    recall20 = np.mean(hit_list) * 100.0
-    mrr20 = np.mean(mrr_list) * 100.0
-    return [recall20, mrr20]
+    metrics = {}
+    for k in ks:
+        metrics[f'Recall@{k}'] = float(np.mean(hits_per_k[k]) * 100.0)
+        metrics[f'MRR@{k}'] = float(np.mean(mrr_per_k[k]) * 100.0)
+    return metrics
+
