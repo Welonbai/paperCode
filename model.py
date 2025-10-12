@@ -1,6 +1,6 @@
 ﻿# model.py
 import math
-from typing import List
+from typing import List, Dict
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -22,6 +22,96 @@ class GlobalGraphBranch(nn.Module):
         return self.aggregator(projected, self.edge_index, self.edge_weight)
 
 
+class UnifiedGlobalEncoder(nn.Module):
+    def __init__(
+        self,
+        modalities: List[str],
+        features: Dict[str, torch.Tensor],
+        edge_index: torch.Tensor,
+        edge_type: torch.Tensor,
+        edge_weight: torch.Tensor,
+        hidden_size: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if not modalities:
+            raise ValueError("UnifiedGlobalEncoder requires at least one modality.")
+        self.modalities = modalities
+        self.hidden_size = hidden_size
+
+        self.projectors = nn.ModuleDict()
+        for modality in modalities:
+            feat = torch.as_tensor(features[modality], dtype=torch.float32)
+            self.register_buffer(f"feat_{modality}", feat)
+            self.projectors[modality] = nn.Linear(feat.size(1), hidden_size, bias=False)
+
+        edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        edge_type = torch.as_tensor(edge_type, dtype=torch.long)
+        edge_weight = torch.as_tensor(edge_weight, dtype=torch.float32)
+
+        self.register_buffer("edge_index", edge_index)
+        self.register_buffer("edge_type", edge_type)
+        self.register_buffer("edge_weight", edge_weight)
+
+        unique_relations = torch.unique(edge_type).tolist()
+        unique_relations = [int(r) for r in sorted(unique_relations)]
+        self.relation_ids = unique_relations
+
+        self.relation_linears = nn.ModuleDict({
+            str(rel): nn.Linear(hidden_size, hidden_size, bias=False) for rel in unique_relations
+        })
+
+        for rel in unique_relations:
+            rel_mask = (edge_type == rel).nonzero(as_tuple=False).view(-1)
+            self.register_buffer(f"edge_ids_rel_{rel}", rel_mask)
+
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def _base_embedding(self) -> torch.Tensor:
+        projected = []
+        for modality in self.modalities:
+            feat = getattr(self, f"feat_{modality}")
+            proj = self.projectors[modality](feat)
+            projected.append(proj)
+        h0 = torch.stack(projected, dim=0).mean(dim=0)
+        h0 = h0.clone()
+        if h0.size(0) > 0:
+            h0[0] = 0
+        return h0
+
+    def forward(self) -> torch.Tensor:
+        h0 = self._base_embedding()
+        device = h0.device
+        edge_index = self.edge_index.to(device)
+        edge_weight = self.edge_weight.to(device)
+
+        aggregated = torch.zeros_like(h0)
+        num_nodes = h0.size(0)
+        for rel in self.relation_ids:
+            edge_ids = getattr(self, f"edge_ids_rel_{rel}").to(device)
+            if edge_ids.numel() == 0:
+                continue
+            src = edge_index[0, edge_ids]
+            dst = edge_index[1, edge_ids]
+            weights = edge_weight[edge_ids]
+            neighbor_embed = self.relation_linears[str(rel)](h0[src])
+            weighted_msgs = neighbor_embed * weights.unsqueeze(-1)
+
+            agg_rel = torch.zeros_like(h0)
+            agg_rel.index_add_(0, dst, weighted_msgs)
+
+            denom = h0.new_zeros(num_nodes)
+            denom.index_add_(0, dst, weights)
+            denom = denom.clamp_min_(1e-8).unsqueeze(-1)
+            mean_rel = agg_rel / denom
+            aggregated = aggregated + mean_rel
+
+        h1 = self.layer_norm(h0 + self.dropout(aggregated))
+        if h1.size(0) > 0:
+            h1[0] = 0
+        return h1
+
 
 class CombineGraph(nn.Module):
     """
@@ -34,13 +124,14 @@ class CombineGraph(nn.Module):
       - edge_index / features / edge_weight: legacy single-graph arguments kept for backward compatibility.
     """
 
-    def __init__(self, opt, num_node, global_graphs=None, edge_index=None, edge_weight=None, features=None):
+    def __init__(self, opt, num_node, global_graphs=None, edge_index=None, edge_weight=None, features=None, unified_graph=None):
         super().__init__()
         self.opt = opt
         self.batch_size = opt.batch_size
         self.num_node = num_node                      # number of real items (ids 1..num_node)
         self.hidden_size = opt.hiddenSize
         self.dropout_local = opt.dropout_local
+        self.global_mode = 'legacy'
 
         # ---------------------------
         # Local/session branch
@@ -64,6 +155,7 @@ class CombineGraph(nn.Module):
         # ---------------------------
         # Global/catalog branch (optional)
         # ---------------------------
+        self.unified_encoder: UnifiedGlobalEncoder | None = None
         if global_graphs is None:
             if edge_index is not None and features is not None:
                 global_graphs = [{
@@ -79,49 +171,70 @@ class CombineGraph(nn.Module):
 
         self.global_branches = nn.ModuleList()
         self.global_modalities: List[str] = []
-
-        for idx, graph in enumerate(global_graphs):
-            tag = graph.get('tag', f'graph{idx}')
-            features_data = graph.get('features')
-            edge_index_data = graph.get('edge_index')
-            edge_weight_data = graph.get('edge_weight')
-
-            if features_data is None or edge_index_data is None:
-                print(f"[warn] [CombineGraph] Global graph '{tag}' missing features or edge_index. Skipping.")
-                continue
-
-            features_tensor = torch.as_tensor(features_data, dtype=torch.float32)
-            edge_index_tensor = torch.as_tensor(edge_index_data, dtype=torch.long)
-
-            if edge_index_tensor.dim() != 2 or edge_index_tensor.size(0) != 2:
-                raise ValueError(f"[CombineGraph] edge_index for '{tag}' must have shape [2, E], got {tuple(edge_index_tensor.shape)}")
-            if features_tensor.dim() != 2:
-                raise ValueError(f"[CombineGraph] features for '{tag}' must be 2D, got {tuple(features_tensor.shape)}")
-            if features_tensor.size(0) != (num_node + 1):
-                print(f"[warn] [CombineGraph] features rows ({features_tensor.size(0)}) != num_node+1 ({num_node+1}) for '{tag}'.")
-
-            if edge_weight_data is None:
-                edge_weight_tensor = torch.ones(edge_index_tensor.size(1), dtype=torch.float32)
-            else:
-                edge_weight_tensor = torch.as_tensor(edge_weight_data, dtype=torch.float32).view(-1)
-                if edge_weight_tensor.size(0) != edge_index_tensor.size(1):
-                    raise ValueError(
-                        f"[CombineGraph] edge_weight length ({edge_weight_tensor.size(0)}) does not match edge_index columns ({edge_index_tensor.size(1)}) for '{tag}'."
-                    )
-
-            branch = GlobalGraphBranch(
-                features_tensor,
-                edge_index_tensor,
-                edge_weight_tensor,
-                self.hidden_size,
-                opt.dropout_global,
-                torch.relu,
-                tag=tag,
+        if unified_graph is not None:
+            self.global_mode = 'unified'
+            modalities = unified_graph.get('modalities', [])
+            features_map = unified_graph.get('features', {})
+            edge_index_u = unified_graph.get('edge_index')
+            edge_type_u = unified_graph.get('edge_type')
+            edge_weight_u = unified_graph.get('edge_weight')
+            if edge_index_u is None or edge_type_u is None or edge_weight_u is None:
+                raise ValueError("[CombineGraph] Unified graph payload missing tensors.")
+            if not modalities:
+                raise ValueError("[CombineGraph] Unified graph requires modality list.")
+            self.unified_encoder = UnifiedGlobalEncoder(
+                modalities=modalities,
+                features={mod: features_map[mod] for mod in modalities},
+                edge_index=edge_index_u,
+                edge_type=edge_type_u,
+                edge_weight=edge_weight_u,
+                hidden_size=self.hidden_size,
+                dropout=opt.dropout_global,
             )
-            self.global_branches.append(branch)
-            self.global_modalities.append(tag)
+            self.has_global_graph = True
+        else:
+            for idx, graph in enumerate(global_graphs):
+                tag = graph.get('tag', f'graph{idx}')
+                features_data = graph.get('features')
+                edge_index_data = graph.get('edge_index')
+                edge_weight_data = graph.get('edge_weight')
 
-        self.has_global_graph = len(self.global_branches) > 0
+                if features_data is None or edge_index_data is None:
+                    print(f"[warn] [CombineGraph] Global graph '{tag}' missing features or edge_index. Skipping.")
+                    continue
+
+                features_tensor = torch.as_tensor(features_data, dtype=torch.float32)
+                edge_index_tensor = torch.as_tensor(edge_index_data, dtype=torch.long)
+
+                if edge_index_tensor.dim() != 2 or edge_index_tensor.size(0) != 2:
+                    raise ValueError(f"[CombineGraph] edge_index for '{tag}' must have shape [2, E], got {tuple(edge_index_tensor.shape)}")
+                if features_tensor.dim() != 2:
+                    raise ValueError(f"[CombineGraph] features for '{tag}' must be 2D, got {tuple(features_tensor.shape)}")
+                if features_tensor.size(0) != (num_node + 1):
+                    print(f"[warn] [CombineGraph] features rows ({features_tensor.size(0)}) != num_node+1 ({num_node+1}) for '{tag}'.")
+
+                if edge_weight_data is None:
+                    edge_weight_tensor = torch.ones(edge_index_tensor.size(1), dtype=torch.float32)
+                else:
+                    edge_weight_tensor = torch.as_tensor(edge_weight_data, dtype=torch.float32).view(-1)
+                    if edge_weight_tensor.size(0) != edge_index_tensor.size(1):
+                        raise ValueError(
+                            f"[CombineGraph] edge_weight length ({edge_weight_tensor.size(0)}) does not match edge_index columns ({edge_index_tensor.size(1)}) for '{tag}'."
+                        )
+
+                branch = GlobalGraphBranch(
+                    features_tensor,
+                    edge_index_tensor,
+                    edge_weight_tensor,
+                    self.hidden_size,
+                    opt.dropout_global,
+                    torch.relu,
+                    tag=tag,
+                )
+                self.global_branches.append(branch)
+                self.global_modalities.append(tag)
+
+            self.has_global_graph = len(self.global_branches) > 0
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
@@ -201,22 +314,23 @@ class CombineGraph(nn.Module):
         local_hidden = F.dropout(local_hidden, self.dropout_local, training=self.training)
 
         # ----- Global/catalog branch (optional) -----
-        if self.has_global_graph:
+        fused_hidden = local_hidden
+        if self.global_mode == 'unified' and self.unified_encoder is not None:
+            global_node_emb = self.unified_encoder()                         # [N+1, hidden]
+            branch_hidden = global_node_emb[inputs]                          # [batch, n_nodes, hidden]
+            fused_hidden = fused_hidden + branch_hidden
+        elif self.has_global_graph and len(self.global_branches) > 0:
             aggregated_global = None
             for branch in self.global_branches:
-                global_node_emb = branch()                                  # [N+1, hidden]
-                branch_hidden = global_node_emb[inputs]                     # [batch, n_nodes, hidden]
+                global_node_emb = branch()                                   # [N+1, hidden]
+                branch_hidden = global_node_emb[inputs]                      # [batch, n_nodes, hidden]
                 if aggregated_global is None:
                     aggregated_global = branch_hidden
                 else:
                     aggregated_global = aggregated_global + branch_hidden
             if aggregated_global is not None:
                 aggregated_global = aggregated_global / len(self.global_branches)
-                fused_hidden = local_hidden + aggregated_global
-            else:
-                fused_hidden = local_hidden
-        else:
-            fused_hidden = local_hidden
+                fused_hidden = fused_hidden + aggregated_global
 
         return fused_hidden
 

@@ -3,13 +3,24 @@ import argparse
 import pickle
 import os
 import numpy as np
+from typing import Dict, Any, List
 from model import *
 from utils import *
 
-def load_image_global_graph(path):
+def load_pickle_graph(path):
     with open(path, 'rb') as f:
         graph = pickle.load(f)
     return graph
+
+
+def load_modality_embedding_matrix(dataset: str, modality: str) -> np.ndarray:
+    emb_path = os.path.join('datasets', dataset, 'embeddings', f'{modality}_matrix.npy')
+    if not os.path.exists(emb_path):
+        raise FileNotFoundError(f'Embedding matrix not found for modality={modality}: {emb_path}')
+    matrix = np.load(emb_path)
+    if matrix.ndim != 2:
+        raise ValueError(f'Embedding matrix for modality={modality} expected 2D, got shape {matrix.shape}')
+    return matrix.astype(np.float32)
 
 def init_seed(seed=None):
     if seed is None:
@@ -70,6 +81,36 @@ def debug_check_global_graph(graphs, num_node):
                 print(f"   degree stats over real nodes: min={int(d.min())}, med={float(np.median(d)):.1f}, max={int(d.max())}")
         if edge_weight is not None and edge_weight.size > 0:
             print(f"   edge_weight stats: min={float(edge_weight.min()):.4f}, mean={float(edge_weight.mean()):.4f}, max={float(edge_weight.max()):.4f}")
+    print("=============================")
+
+
+def debug_check_unified_graph(unified_graph, num_node):
+    if not unified_graph:
+        print("[debug] unified graph payload empty.")
+        return
+    print("===== DBG[unified global graph] =====")
+    edge_index = unified_graph.get("edge_index")
+    edge_type = unified_graph.get("edge_type")
+    edge_weight = unified_graph.get("edge_weight")
+    meta = unified_graph.get("meta", {})
+    relation_map = unified_graph.get("relation_map", {})
+    modalities = unified_graph.get("modalities", [])
+    arr_index = np.asarray(edge_index)
+    arr_type = np.asarray(edge_type)
+    arr_weight = np.asarray(edge_weight)
+    print(f"edge_index.shape={arr_index.shape}")
+    print(f"edge_type.shape={arr_type.shape}, edge_weight.shape={arr_weight.shape}")
+    if arr_index.size > 0:
+        vmin, vmax = int(arr_index.min()), int(arr_index.max())
+        print(f"node id range in edges: [{vmin}, {vmax}] (expected ≤ {num_node})")
+    rel_counts = {}
+    for rel in np.unique(arr_type):
+        rel_counts[int(rel)] = int((arr_type == rel).sum())
+    print(f"relation edge counts: {rel_counts}")
+    print(f"modalities: {modalities}")
+    print(f"relation_map: {relation_map}")
+    if arr_weight.size > 0:
+        print(f"edge_weight stats min/median/max: {float(arr_weight.min()):.4f}/{float(np.median(arr_weight)):.4f}/{float(arr_weight.max()):.4f}")
     print("=============================")
 def debug_check_dataset(train_data, test_data, num_node):
     print("===== DBG[data] =====")
@@ -137,10 +178,14 @@ parser.add_argument('--valid_portion', type=float, default=0.1, help='split the 
 parser.add_argument('--alpha', type=float, default=0.2, help='Alpha for the leaky_relu.')
 parser.add_argument('--patience', type=int, default=3)
 parser.add_argument('--global_graph_mods', type=str, default='image',
-                    help='Modality tag for global graph filename, e.g. "image", "image+category". '
+                    help='(legacy mode only) Modality tag for global graph filename, e.g. "image", "image+category". '
                          'Set empty string to disable loading.')
 parser.add_argument('--disable_global_fusion', action='store_true',
                     help='Ignore global graph even if found (use local/session branch only).')
+parser.add_argument('--global_graph_mode', choices=('legacy', 'unified'), default='legacy',
+                    help='legacy: load per-modality branches (current behaviour); unified: load relation-aware unified graph.')
+parser.add_argument('--unified_graph_path', type=str, default='',
+                    help='Optional explicit path to unified graph pickle. Defaults to datasets/<dataset>/global_graph/global_graph_unified.pkl')
 parser.add_argument('--debug_sanity', action='store_true',
                     help='Print extra diagnostics (targets, id ranges, NaNs, degree stats, zero-row check).')
 
@@ -189,79 +234,130 @@ def main():
 
     # ---------------- Load global graph (optional) ----------------
     global_graphs = []
-    mod_tag_raw = getattr(opt, "global_graph_mods", "").strip()
-    if mod_tag_raw and not opt.disable_global_fusion:
-        mod_tags = [seg.strip() for seg in mod_tag_raw.replace(",", "+").split("+") if seg.strip()]
-        if not mod_tags:
-            print("[warn] --global_graph_mods provided but no valid tags were parsed. Global graph disabled.")
+    unified_graph_payload: Dict[str, Any] | None = None
+
+    if opt.disable_global_fusion:
+        print("[warn] --disable_global_fusion set. Global graph will NOT be used even if present.")
+    elif opt.global_graph_mode == 'unified':
+        default_unified_path = os.path.join("datasets", opt.dataset, "global_graph", "global_graph_unified.pkl")
+        graph_path = opt.unified_graph_path or default_unified_path
+        if not os.path.exists(graph_path):
+            print(f"[warn] Unified global graph not found at {graph_path}. Proceeding without global fusion.")
         else:
-            expected_items = None
-            for tag in mod_tags:
-                gg_name = f"global_graph_{tag}.pkl"
-                graph_path = os.path.join("datasets", opt.dataset, "global_graph", gg_name)
-                if not os.path.exists(graph_path):
-                    legacy = os.path.join("datasets", opt.dataset, "global_graph", f"global_graph_dec_{tag}.pkl")
-                    if os.path.exists(legacy):
-                        print(f"[warn] Requested global graph not found at {graph_path}. Falling back to legacy: {legacy}")
-                        graph_path = legacy
-                    else:
-                        legacy = os.path.join("datasets", opt.dataset, "image_global_graph_dec.pkl")
-                        if os.path.exists(legacy) and tag == mod_tags[0]:
+            unified_raw = load_pickle_graph(graph_path)
+            edge_index = unified_raw.get("edge_index")
+            edge_type = unified_raw.get("edge_type")
+            edge_weight = unified_raw.get("edge_weight")
+            if edge_index is None or edge_type is None or edge_weight is None:
+                print(f"[warn] Unified graph at {graph_path} is missing tensors. Skipping unified mode.")
+            else:
+                meta = unified_raw.get("meta", {})
+                modalities: List[str] = meta.get("modalities") or []
+                relation_map = meta.get("relation_map") or {}
+                if not modalities and relation_map:
+                    modalities = [name for name, _ in sorted(relation_map.items(), key=lambda kv: kv[1])]
+                if not modalities:
+                    raise ValueError("Unified graph metadata must include 'modalities' or 'relation_map'.")
+                modality_features: Dict[str, np.ndarray] = {}
+                for modality in modalities:
+                    modality_features[modality] = load_modality_embedding_matrix(opt.dataset, modality)
+
+                rows_with_pad = meta.get("num_nodes_including_padding")
+                if rows_with_pad is None:
+                    rows_with_pad = next(iter(modality_features.values())).shape[0]
+                items_in_graph = rows_with_pad - 1
+                if items_in_graph != num_node:
+                    print(f"[warn] Adjusting num_node from {num_node} to {items_in_graph} based on unified graph.")
+                    num_node = items_in_graph
+
+                unified_graph_payload = {
+                    "edge_index": edge_index,
+                    "edge_type": edge_type,
+                    "edge_weight": edge_weight,
+                    "meta": meta,
+                    "modalities": modalities,
+                    "relation_map": relation_map,
+                    "features": modality_features,
+                    "path": graph_path,
+                }
+                print(f"[ok] Loaded unified global graph -> {graph_path}")
+                print(f"   modalities: {modalities}")
+                print(f"   edge_index shape: {np.asarray(edge_index).shape}, edge_type len: {len(edge_type)}, edge_weight len: {len(edge_weight)}")
+    else:
+        mod_tag_raw = getattr(opt, "global_graph_mods", "").strip()
+        if mod_tag_raw:
+            mod_tags = [seg.strip() for seg in mod_tag_raw.replace(",", "+").split("+") if seg.strip()]
+            if not mod_tags:
+                print("[warn] --global_graph_mods provided but no valid tags were parsed. Global graph disabled.")
+            else:
+                expected_items = None
+                for tag in mod_tags:
+                    gg_name = f"global_graph_{tag}.pkl"
+                    graph_path = os.path.join("datasets", opt.dataset, "global_graph", gg_name)
+                    if not os.path.exists(graph_path):
+                        legacy = os.path.join("datasets", opt.dataset, "global_graph", f"global_graph_dec_{tag}.pkl")
+                        if os.path.exists(legacy):
                             print(f"[warn] Requested global graph not found at {graph_path}. Falling back to legacy: {legacy}")
                             graph_path = legacy
-                if not os.path.exists(graph_path):
-                    print(f"[warn] No global graph file found for tag={tag}: {graph_path}. Skipping.")
-                    continue
-                global_graph = load_image_global_graph(graph_path)
-                edge_index = global_graph.get("edge_index")
-                features = global_graph.get("x")
-                edge_weight = global_graph.get("edge_weight")
-                if edge_index is None or features is None:
-                    print(f"[warn] Global graph at {graph_path} missing edge_index or features. Skipping.")
-                    continue
-                meta = global_graph.get("meta", {})
-                rows_with_pad = meta.get("num_nodes_including_padding", getattr(features, "shape", [0])[0])
-                items_in_graph = rows_with_pad - 1
-                shape_x = getattr(features, "shape", None)
-                shape_e = getattr(edge_index, "shape", None)
-                print(f"[ok] Using global graph [{tag}] -> {graph_path}")
-                print(f"   x shape: {shape_x}, edge_index shape: {shape_e}")
-                if edge_weight is not None:
-                    ew_len = edge_weight.shape[0] if hasattr(edge_weight, "shape") else len(edge_weight)
-                    print(f"   edge_weight len: {ew_len}")
-                print(f"   rows (incl. pad): {rows_with_pad}  -> items: {items_in_graph}")
-                if expected_items is None:
-                    expected_items = items_in_graph
-                    if expected_items != num_node:
-                        print(f"[warn] Setting num_node = {expected_items} (was {num_node}) to align with global graph.")
-                        num_node = expected_items
-                elif items_in_graph != expected_items:
-                    print(f"[warn] Global graph [{tag}] has item count {items_in_graph}, expected {expected_items}.")
-                global_graphs.append({
-                    "tag": tag,
-                    "edge_index": edge_index,
-                    "edge_weight": edge_weight,
-                    "features": features,
-                    "meta": meta,
-                    "path": graph_path,
-                    "items": items_in_graph,
-                })
-            if not global_graphs:
-                print("[warn] No global graphs were loaded. Continuing without global fusion.")
-    elif opt.disable_global_fusion:
-        print("[warn] --disable_global_fusion set. Global graph will NOT be used even if present.")
-    else:
-        print(
-            "[info] --global_graph_mods not set. Global graph will NOT be used.\n"
-            "   To enable, pass for example: --global_graph_mods image_knn  or  --global_graph_mods \"image_knn+category_knn\""
-        )
+                        else:
+                            legacy = os.path.join("datasets", opt.dataset, "image_global_graph_dec.pkl")
+                            if os.path.exists(legacy) and tag == mod_tags[0]:
+                                print(f"[warn] Requested global graph not found at {graph_path}. Falling back to legacy: {legacy}")
+                                graph_path = legacy
+                    if not os.path.exists(graph_path):
+                        print(f"[warn] No global graph file found for tag={tag}: {graph_path}. Skipping.")
+                        continue
+                    global_graph = load_pickle_graph(graph_path)
+                    edge_index = global_graph.get("edge_index")
+                    features = global_graph.get("x")
+                    edge_weight = global_graph.get("edge_weight")
+                    if edge_index is None or features is None:
+                        print(f"[warn] Global graph at {graph_path} missing edge_index or features. Skipping.")
+                        continue
+                    meta = global_graph.get("meta", {})
+                    rows_with_pad = meta.get("num_nodes_including_padding", getattr(features, "shape", [0])[0])
+                    items_in_graph = rows_with_pad - 1
+                    shape_x = getattr(features, "shape", None)
+                    shape_e = getattr(edge_index, "shape", None)
+                    print(f"[ok] Using global graph [{tag}] -> {graph_path}")
+                    print(f"   x shape: {shape_x}, edge_index shape: {shape_e}")
+                    if edge_weight is not None:
+                        ew_len = edge_weight.shape[0] if hasattr(edge_weight, "shape") else len(edge_weight)
+                        print(f"   edge_weight len: {ew_len}")
+                    print(f"   rows (incl. pad): {rows_with_pad}  -> items: {items_in_graph}")
+                    if expected_items is None:
+                        expected_items = items_in_graph
+                        if expected_items != num_node:
+                            print(f"[warn] Setting num_node = {expected_items} (was {num_node}) to align with global graph.")
+                            num_node = expected_items
+                    elif items_in_graph != expected_items:
+                        print(f"[warn] Global graph [{tag}] has item count {items_in_graph}, expected {expected_items}.")
+                    global_graphs.append({
+                        "tag": tag,
+                        "edge_index": edge_index,
+                        "edge_weight": edge_weight,
+                        "features": features,
+                        "meta": meta,
+                        "path": graph_path,
+                        "items": items_in_graph,
+                    })
+                if not global_graphs:
+                    print("[warn] No global graphs were loaded. Continuing without global fusion.")
+        else:
+            print(
+                "[info] --global_graph_mods not set. Global graph will NOT be used.\n"
+                "   To enable, pass for example: --global_graph_mods image_knn  or  --global_graph_mods \"image_knn+category_knn\""
+            )
     # adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     # num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     train_data = Data(train_data)
     test_data = Data(test_data)
     if opt.debug_sanity:
         debug_check_dataset(train_data, test_data, num_node)
-        debug_check_global_graph(global_graphs, num_node)
+        if unified_graph_payload:
+            debug_check_unified_graph(unified_graph_payload, num_node)
+        else:
+            debug_check_global_graph(global_graphs, num_node)
 
 
     # adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
@@ -275,12 +371,14 @@ def main():
     print(f"num_node (embedding size): {num_node}")
     if max_test_id >= num_node:
         print("[warn] Test set has item ID exceeding num_node — this will cause an indexing error!")
-    if global_graphs:
+    if unified_graph_payload:
+        print("[info] CombineGraph will be initialized WITH unified global graph.")
+    elif global_graphs:
         print(f"[info] CombineGraph will be initialized WITH {len(global_graphs)} global graph(s).")
     else:
         print("[info] CombineGraph will be initialized WITHOUT a global graph.")
 
-    model = trans_to_cuda(CombineGraph(opt, num_node, global_graphs=global_graphs))
+    model = trans_to_cuda(CombineGraph(opt, num_node, global_graphs=global_graphs, unified_graph=unified_graph_payload))
     print(f"[CombineGraph] has_global_graph={getattr(model, 'has_global_graph', None)}")
     if opt.debug_sanity:
         debug_peek_one_batch(opt, model, train_data, note="train-before-train")
