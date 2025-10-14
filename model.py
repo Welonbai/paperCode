@@ -1,6 +1,6 @@
 ﻿# model.py
 import math
-from typing import List, Dict
+from typing import List, Dict, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -22,6 +22,50 @@ class GlobalGraphBranch(nn.Module):
         return self.aggregator(projected, self.edge_index, self.edge_weight)
 
 
+class GatedNodeEmbeddingFusion(nn.Module):
+    def __init__(self, modalities: List[str], hidden_size: int, log_gate_stats: bool = False):
+        super().__init__()
+        self.modalities = modalities
+        self.hidden_size = hidden_size
+        self.log_gate_stats = log_gate_stats
+
+        self.layer_norms = nn.ModuleDict({
+            modality: nn.LayerNorm(hidden_size)
+            for modality in modalities
+        })
+
+        gate_hidden = max(hidden_size // 2, 16)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_size * len(modalities), gate_hidden),
+            nn.ReLU(),
+            nn.Linear(gate_hidden, len(modalities)),
+        )
+
+        self.latest_gate_mean: Optional[torch.Tensor] = None
+
+    def forward(self, embeddings: Dict[str, torch.Tensor]) -> torch.Tensor:
+        normed_list = []
+        for modality in self.modalities:
+            proj = embeddings[modality]
+            normed = self.layer_norms[modality](proj)
+            normed_list.append(normed)
+
+        stacked = torch.stack(normed_list, dim=1)                            # [N+1, M, d]
+        fused_input = torch.cat(normed_list, dim=-1)                         # [N+1, M*d]
+
+        logits = self.gate_mlp(fused_input)                                  # [N+1, M]
+        weights = torch.softmax(logits, dim=-1)                              # [N+1, M]
+
+        fused = torch.sum(weights.unsqueeze(-1) * stacked, dim=1)            # [N+1, d]
+        if fused.size(0) > 0:
+            fused[0] = 0
+
+        if self.log_gate_stats:
+            self.latest_gate_mean = weights.mean(dim=0).detach().cpu()
+
+        return fused
+
+
 class UnifiedGlobalEncoder(nn.Module):
     def __init__(
         self,
@@ -32,12 +76,16 @@ class UnifiedGlobalEncoder(nn.Module):
         edge_weight: torch.Tensor,
         hidden_size: int,
         dropout: float,
+        fuse_mode: str = 'avg',
+        log_gate_stats: bool = False,
     ):
         super().__init__()
         if not modalities:
             raise ValueError("UnifiedGlobalEncoder requires at least one modality.")
         self.modalities = modalities
         self.hidden_size = hidden_size
+        self.fuse_mode = fuse_mode
+        self.log_gate_stats = log_gate_stats
 
         self.projectors = nn.ModuleDict()
         for modality in modalities:
@@ -67,17 +115,29 @@ class UnifiedGlobalEncoder(nn.Module):
 
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
+        self.gated_fusion: Optional[GatedNodeEmbeddingFusion] = None
+        if self.fuse_mode == 'gate' and len(modalities) > 1:
+            self.gated_fusion = GatedNodeEmbeddingFusion(modalities, hidden_size, log_gate_stats=log_gate_stats)
+        self.latest_gate_mean: Optional[torch.Tensor] = None
 
     def _base_embedding(self) -> torch.Tensor:
-        projected = []
+        projected_map: Dict[str, torch.Tensor] = {}
         for modality in self.modalities:
             feat = getattr(self, f"feat_{modality}")
             proj = self.projectors[modality](feat)
-            projected.append(proj)
-        h0 = torch.stack(projected, dim=0).mean(dim=0)
-        h0 = h0.clone()
-        if h0.size(0) > 0:
-            h0[0] = 0
+            projected_map[modality] = proj
+
+        if self.gated_fusion is not None:
+            h0 = self.gated_fusion(projected_map)
+            if self.log_gate_stats:
+                self.latest_gate_mean = self.gated_fusion.latest_gate_mean
+        else:
+            proj_stack = torch.stack([projected_map[mod] for mod in self.modalities], dim=0)
+            h0 = proj_stack.mean(dim=0)
+            h0 = h0.clone()
+            if h0.size(0) > 0:
+                h0[0] = 0
+
         return h0
 
     def forward(self) -> torch.Tensor:
@@ -132,6 +192,7 @@ class CombineGraph(nn.Module):
         self.hidden_size = opt.hiddenSize
         self.dropout_local = opt.dropout_local
         self.global_mode = 'legacy'
+        self.node_embedding_fuse = getattr(opt, 'node_embedding_fuse', 'avg')
 
         # ---------------------------
         # Local/session branch
@@ -155,7 +216,8 @@ class CombineGraph(nn.Module):
         # ---------------------------
         # Global/catalog branch (optional)
         # ---------------------------
-        self.unified_encoder: UnifiedGlobalEncoder | None = None
+        self.unified_encoder: Optional[UnifiedGlobalEncoder] = None
+        self.has_global_graph = False
         if global_graphs is None:
             if edge_index is not None and features is not None:
                 global_graphs = [{
@@ -190,6 +252,8 @@ class CombineGraph(nn.Module):
                 edge_weight=edge_weight_u,
                 hidden_size=self.hidden_size,
                 dropout=opt.dropout_global,
+                fuse_mode=self.node_embedding_fuse,
+                log_gate_stats=bool(getattr(opt, 'debug_sanity', False)),
             )
             self.has_global_graph = True
         else:
@@ -377,7 +441,7 @@ def forward(model, batch):
     return targets, scores
 
 
-def train_test(model, train_data, test_data):
+def train_test(model, train_data, eval_datasets):
     import datetime
     from tqdm import tqdm
     import numpy as np
@@ -442,31 +506,45 @@ def train_test(model, train_data, test_data):
 
     print('start predicting: ', datetime.datetime.now())
     model.eval()
-    test_loader = torch.utils.data.DataLoader(test_data, num_workers=4, batch_size=model.batch_size,
-                                              shuffle=False, pin_memory=True)
     ks = [5, 10, 20]
-    hits_per_k = {k: [] for k in ks}
-    mrr_per_k = {k: [] for k in ks}
     max_k = max(ks)
-    with torch.no_grad():
-        for batch in test_loader:
-            targets, scores = forward(model, batch)
-            topk_indices = scores.topk(max_k)[1].detach().cpu().numpy()  # [batch, max_k]
-            targets_np = targets.detach().cpu().numpy() - 1  # convert to 0-based once
-            for pred_row, tgt_idx in zip(topk_indices, targets_np):
-                for k in ks:
-                    candidate_row = pred_row[:k]
-                    hit = tgt_idx in candidate_row
-                    hits_per_k[k].append(hit)
-                    if hit:
-                        rank = int(np.where(candidate_row == tgt_idx)[0][0]) + 1
-                        mrr_per_k[k].append(1.0 / rank)
-                    else:
-                        mrr_per_k[k].append(0.0)
+    results = {}
 
-    metrics = {}
-    for k in ks:
-        metrics[f'Recall@{k}'] = float(np.mean(hits_per_k[k]) * 100.0)
-        metrics[f'MRR@{k}'] = float(np.mean(mrr_per_k[k]) * 100.0)
-    return metrics
+    with torch.no_grad():
+        for split_name, dataset in eval_datasets:
+            loader = torch.utils.data.DataLoader(dataset, num_workers=4, batch_size=model.batch_size,
+                                                 shuffle=False, pin_memory=True)
+            hits_per_k = {k: [] for k in ks}
+            mrr_per_k = {k: [] for k in ks}
+            loss_sum = 0.0
+            sample_count = 0
+            for batch in loader:
+                targets, scores = forward(model, batch)
+                targets = trans_to_cuda(targets).long()
+                loss = model.loss_function(scores, targets - 1)
+                loss_sum += float(loss.detach().cpu().item()) * targets.size(0)
+                sample_count += targets.size(0)
+
+                topk_indices = scores.topk(max_k)[1].detach().cpu().numpy()  # [batch, max_k]
+                targets_np = targets.detach().cpu().numpy() - 1  # convert to 0-based once
+                for pred_row, tgt_idx in zip(topk_indices, targets_np):
+                    for k in ks:
+                        candidate_row = pred_row[:k]
+                        hit = tgt_idx in candidate_row
+                        hits_per_k[k].append(hit)
+                        if hit:
+                            rank = int(np.where(candidate_row == tgt_idx)[0][0]) + 1
+                            mrr_per_k[k].append(1.0 / rank)
+                        else:
+                            mrr_per_k[k].append(0.0)
+
+            metrics = {}
+            if sample_count > 0:
+                metrics['Loss'] = loss_sum / sample_count
+            for k in ks:
+                metrics[f'Recall@{k}'] = float(np.mean(hits_per_k[k]) * 100.0)
+                metrics[f'MRR@{k}'] = float(np.mean(mrr_per_k[k]) * 100.0)
+            results[split_name] = metrics
+
+    return total_loss, results
 

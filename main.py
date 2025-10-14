@@ -155,6 +155,13 @@ def debug_peek_one_batch(opt, model, dataset, note="train"):
         top1 = scores.argmax(dim=1).cpu().numpy()
         acc1 = (top1 == (t.cpu().numpy() - 1)).mean()
         print(f"top1 accuracy on this batch: {acc1*100:.2f}%")
+        if getattr(model, "global_mode", None) == 'unified':
+            gate_mean = getattr(model.unified_encoder, "latest_gate_mean", None)
+            if gate_mean is not None:
+                modal_names = getattr(model.unified_encoder, "modalities", [])
+                gate_vals = gate_mean.tolist()
+                paired = ", ".join(f"{name}:{val:.3f}" for name, val in zip(modal_names, gate_vals))
+                print(f"mean gate weights -> {paired}")
     print("==================================")
 
 parser = argparse.ArgumentParser()
@@ -186,6 +193,8 @@ parser.add_argument('--global_graph_mode', choices=('legacy', 'unified'), defaul
                     help='legacy: load per-modality branches (current behaviour); unified: load relation-aware unified graph.')
 parser.add_argument('--unified_graph_path', type=str, default='',
                     help='Optional explicit path to unified graph pickle. Defaults to datasets/<dataset>/global_graph/global_graph_unified.pkl')
+parser.add_argument('--node_embedding_fuse', choices=('avg', 'gate'), default='avg',
+                    help='(unified mode) How to combine modality projections into the base node embedding: avg or gate.')
 parser.add_argument('--debug_sanity', action='store_true',
                     help='Print extra diagnostics (targets, id ranges, NaNs, degree stats, zero-row check).')
 
@@ -195,6 +204,10 @@ opt = parser.parse_args()
 
 def main():
     init_seed(2020)
+
+    if opt.global_graph_mode != 'unified' and opt.node_embedding_fuse != 'avg':
+        print("[warn] --node_embedding_fuse only applies in unified mode. Falling back to 'avg'.")
+        opt.node_embedding_fuse = 'avg'
 
     if opt.dataset == 'diginetica':
         num_node = 43098
@@ -224,12 +237,12 @@ def main():
     else:
         raise ValueError(f"Unsupported dataset: {opt.dataset}")
 
-    train_data = pickle.load(open('datasets/' + opt.dataset + '/train.txt', 'rb'))
+    train_raw = pickle.load(open('datasets/' + opt.dataset + '/train.txt', 'rb'))
+    test_raw = pickle.load(open('datasets/' + opt.dataset + '/test.txt', 'rb'))
     if opt.validation:
-        train_data, valid_data = split_validation(train_data, opt.valid_portion)
-        test_data = valid_data
+        train_raw, valid_raw = split_validation(train_raw, opt.valid_portion)
     else:
-        test_data = pickle.load(open('datasets/' + opt.dataset + '/test.txt', 'rb'))
+        valid_raw = None
 
 
     # ---------------- Load global graph (optional) ----------------
@@ -350,10 +363,11 @@ def main():
             )
     # adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     # num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
-    train_data = Data(train_data)
-    test_data = Data(test_data)
+    train_dataset = Data(train_raw)
+    val_dataset = Data(valid_raw) if valid_raw is not None else None
+    test_dataset = Data(test_raw)
     if opt.debug_sanity:
-        debug_check_dataset(train_data, test_data, num_node)
+        debug_check_dataset(train_dataset, val_dataset if val_dataset is not None else test_dataset, num_node)
         if unified_graph_payload:
             debug_check_unified_graph(unified_graph_payload, num_node)
         else:
@@ -364,8 +378,8 @@ def main():
     # model = trans_to_cuda(CombineGraph(opt, num_node, adj, num))
 
     print("🔍 Checking max item ID in train and test:")
-    max_train_id = max([max(seq) for seq in train_data.inputs if len(seq) > 0])
-    max_test_id = max([max(seq) for seq in test_data.inputs if len(seq) > 0])
+    max_train_id = max([max(seq) for seq in train_dataset.inputs if len(seq) > 0])
+    max_test_id = max([max(seq) for seq in test_dataset.inputs if len(seq) > 0])
     print(f"Max item ID in train: {max_train_id}")
     print(f"Max item ID in test: {max_test_id}")
     print(f"num_node (embedding size): {num_node}")
@@ -381,7 +395,7 @@ def main():
     model = trans_to_cuda(CombineGraph(opt, num_node, global_graphs=global_graphs, unified_graph=unified_graph_payload))
     print(f"[CombineGraph] has_global_graph={getattr(model, 'has_global_graph', None)}")
     if opt.debug_sanity:
-        debug_peek_one_batch(opt, model, train_data, note="train-before-train")
+        debug_peek_one_batch(opt, model, train_dataset, note="train-before-train")
 
 
 
@@ -389,33 +403,54 @@ def main():
     ks = [5, 10, 20]
     metric_keys = [f'Recall@{k}' for k in ks] + [f'MRR@{k}' for k in ks]
     start = time.time()
-    best_result = {key: 0.0 for key in metric_keys}
+    eval_sets = []
+    if val_dataset is not None:
+        eval_sets.append(('val', val_dataset))
+    eval_sets.append(('test', test_dataset))
+    target_split = 'val' if val_dataset is not None else 'test'
+
+    best_result = {key: float('-inf') for key in metric_keys}
     best_epoch = {key: 0 for key in metric_keys}
     bad_counter = 0
 
     for epoch in range(opt.epoch):
         print('-------------------------------------------------------')
         print('epoch: ', epoch)
-        metrics = train_test(model, train_data, test_data)
+        _train_loss_sum, eval_results = train_test(model, train_dataset, eval_sets)
+        metrics_target = eval_results.get(target_split, {})
         flag = 0
         for key in metric_keys:
-            value = metrics.get(key, float('nan'))
+            value = metrics_target.get(key, float('-inf'))
             if value >= best_result.get(key, float('-inf')):
                 best_result[key] = value
                 best_epoch[key] = epoch
                 flag = 1
         print('Current Result:')
-        for k in ks:
-            recall_k = metrics.get(f'Recall@{k}', float('nan'))
-            mrr_k = metrics.get(f'MRR@{k}', float('nan'))
-            print('\tRecall@{}:	{:.4f}\tMRR@{}:	{:.4f}'.format(k, recall_k, k, mrr_k))
-        print('Best Result:')
+        for split_name, metrics in eval_results.items():
+            loss_val = metrics.get('Loss', float('nan'))
+            header = f'  [{split_name}]'
+            if not np.isnan(loss_val):
+                header += f' Loss: {loss_val:.4f}'
+            print(header)
+            for k in ks:
+                recall_k = metrics.get(f"Recall@{k}", float('nan'))
+                mrr_k = metrics.get(f"MRR@{k}", float('nan'))
+                print(f'    Recall@{k}: {recall_k:.4f}    MRR@{k}: {mrr_k:.4f}')
+
+        print(f'Best Result (tracked on {target_split}):')
         for k in ks:
             best_recall = best_result.get(f'Recall@{k}', float('nan'))
             best_mrr = best_result.get(f'MRR@{k}', float('nan'))
             epoch_recall = best_epoch.get(f'Recall@{k}', 0)
             epoch_mrr = best_epoch.get(f'MRR@{k}', 0)
             print('\tRecall@{}:	{:.4f}	Epoch:	{}	MRR@{}:	{:.4f}	Epoch:	{}'.format(k, best_recall, epoch_recall, k, best_mrr, epoch_mrr))
+        if opt.debug_sanity and getattr(model, "global_mode", None) == 'unified':
+            gate_mean = getattr(model.unified_encoder, "latest_gate_mean", None)
+            if gate_mean is not None:
+                modal_names = getattr(model.unified_encoder, "modalities", [])
+                values = gate_mean.tolist()
+                formatted = ", ".join(f"{name}:{val:.3f}" for name, val in zip(modal_names, values))
+                print(f"[DBG] mean gate weights after epoch {epoch}: {formatted}")
         bad_counter += 1 - flag
         if bad_counter >= opt.patience:
             break
