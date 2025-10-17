@@ -2,6 +2,7 @@ import time
 import argparse
 import pickle
 import os
+from pathlib import Path
 import numpy as np
 from model import *
 from utils import *
@@ -143,6 +144,8 @@ parser.add_argument('--disable_global_fusion', action='store_true',
                     help='Ignore global graph even if found (use local/session branch only).')
 parser.add_argument('--debug_sanity', action='store_true',
                     help='Print extra diagnostics (targets, id ranges, NaNs, degree stats, zero-row check).')
+parser.add_argument('--metric_tol', type=float, default=1e-4,
+                    help='Minimum absolute improvement required for a metric to reset patience.')
 
 
 opt = parser.parse_args()
@@ -195,36 +198,46 @@ def main():
         if not mod_tags:
             print("[warn] --global_graph_mods provided but no valid tags were parsed. Global graph disabled.")
         else:
+            base_dir = Path("datasets") / opt.dataset / "global_graph"
             expected_items = None
             for tag in mod_tags:
-                gg_name = f"global_graph_{tag}.pkl"
-                graph_path = os.path.join("datasets", opt.dataset, "global_graph", gg_name)
-                if not os.path.exists(graph_path):
-                    legacy = os.path.join("datasets", opt.dataset, "global_graph", f"global_graph_dec_{tag}.pkl")
-                    if os.path.exists(legacy):
-                        print(f"[warn] Requested global graph not found at {graph_path}. Falling back to legacy: {legacy}")
-                        graph_path = legacy
-                    else:
-                        legacy = os.path.join("datasets", opt.dataset, "image_global_graph_dec.pkl")
-                        if os.path.exists(legacy) and tag == mod_tags[0]:
-                            print(f"[warn] Requested global graph not found at {graph_path}. Falling back to legacy: {legacy}")
-                            graph_path = legacy
-                if not os.path.exists(graph_path):
-                    print(f"[warn] No global graph file found for tag={tag}: {graph_path}. Skipping.")
+                candidates = [
+                    base_dir / f"global_graph_{tag}.pkl",
+                    base_dir / f"global_graph_{tag}_knn.pkl",
+                    base_dir / f"global_graph_{tag}_shared.pkl",
+                ]
+                graph_path = None
+                for cand in candidates:
+                    if cand.exists():
+                        graph_path = cand
+                        break
+                if graph_path is None:
+                    legacy_candidates = [
+                        base_dir / f"global_graph_dec_{tag}.pkl",
+                        base_dir / "image_global_graph_dec.pkl",  # legacy fallback
+                    ]
+                    for cand in legacy_candidates:
+                        if cand.exists():
+                            print(f"[warn] Requested global graph not found for tag '{tag}'. Falling back to: {cand}")
+                            graph_path = cand
+                            break
+                if graph_path is None:
+                    print(f"[warn] No global graph file found for tag='{tag}'. Skipping this modality.")
                     continue
-                global_graph = load_image_global_graph(graph_path)
+                graph_path_str = str(graph_path)
+                global_graph = load_image_global_graph(graph_path_str)
                 edge_index = global_graph.get("edge_index")
                 features = global_graph.get("x")
                 edge_weight = global_graph.get("edge_weight")
                 if edge_index is None or features is None:
-                    print(f"[warn] Global graph at {graph_path} missing edge_index or features. Skipping.")
+                    print(f"[warn] Global graph at {graph_path_str} missing edge_index or features. Skipping.")
                     continue
                 meta = global_graph.get("meta", {})
                 rows_with_pad = meta.get("num_nodes_including_padding", getattr(features, "shape", [0])[0])
                 items_in_graph = rows_with_pad - 1
                 shape_x = getattr(features, "shape", None)
                 shape_e = getattr(edge_index, "shape", None)
-                print(f"[ok] Using global graph [{tag}] -> {graph_path}")
+                print(f"[ok] Using global graph [{tag}] -> {graph_path_str}")
                 print(f"   x shape: {shape_x}, edge_index shape: {shape_e}")
                 if edge_weight is not None:
                     ew_len = edge_weight.shape[0] if hasattr(edge_weight, "shape") else len(edge_weight)
@@ -243,7 +256,7 @@ def main():
                     "edge_weight": edge_weight,
                     "features": features,
                     "meta": meta,
-                    "path": graph_path,
+                    "path": graph_path_str,
                     "items": items_in_graph,
                 })
             if not global_graphs:
@@ -253,7 +266,7 @@ def main():
     else:
         print(
             "[info] --global_graph_mods not set. Global graph will NOT be used.\n"
-            "   To enable, pass for example: --global_graph_mods image_knn  or  --global_graph_mods \"image_knn+category_knn\""
+            "   To enable, pass for example: --global_graph_mods image+title+category_shared"
         )
     # adj = pickle.load(open('datasets/' + opt.dataset + '/adj_' + str(opt.n_sample_all) + '.pkl', 'rb'))
     # num = pickle.load(open('datasets/' + opt.dataset + '/num_' + str(opt.n_sample_all) + '.pkl', 'rb'))
@@ -300,9 +313,12 @@ def main():
         print('epoch: ', epoch)
         metrics = train_test(model, train_data, test_data)
         flag = 0
+        tol = max(0.0, float(opt.metric_tol))
         for key in metric_keys:
             value = metrics.get(key, float('nan'))
-            if value >= best_result.get(key, float('-inf')):
+            if not np.isfinite(value):
+                continue
+            if value > best_result.get(key, float('-inf')) + tol:
                 best_result[key] = value
                 best_epoch[key] = epoch
                 flag = 1

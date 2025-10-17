@@ -11,7 +11,7 @@ import pickle
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                         help='Skip min-max rescaling of final weights to [0,1].')
     parser.add_argument('--min-weight', type=float, default=0.0,
                         help='Drop edges whose refined weight falls below this threshold.')
+    parser.add_argument('--cat-min-degree', type=int, default=10,
+                        help='(single mode, category only) Ensure each node has at least this many category neighbours (after backfill).')
     parser.add_argument('--modalities', default='image,title,category',
                         help='(unified mode) Comma-separated modality list to merge.')
     parser.add_argument('--cap-out-per-rel', type=int, default=None,
@@ -70,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--cap-total', type=int, default=None,
                         help='(unified mode) Maximum undirected degree overall.')
     return parser.parse_args()
+
+
+def load_pickle(path: Path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def load_embedding_matrix(root: Path, dataset: str, modality: str) -> np.ndarray:
@@ -82,7 +89,7 @@ def load_embedding_matrix(root: Path, dataset: str, modality: str) -> np.ndarray
     return matrix.astype(np.float32)
 
 
-def ensure_output_path(root: Path, dataset: str, modality: str, explicit: str | None) -> Path:
+def ensure_output_path(root: Path, dataset: str, modality: str, explicit: Optional[str]) -> Path:
     if explicit:
         out_path = Path(explicit)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,36 +182,61 @@ def apply_pipeline(
     raw_neighbors: Dict[int, set],
     raw_distances: Dict[int, List[float]],
     args: argparse.Namespace,
-) -> Dict[Tuple[int, int], float]:
+) -> Tuple[Dict[Tuple[int, int], float], Dict[int, Dict[int, float]]]:
     mutual_required = not args.disable_mutual
+    if modality == "category":
+        mutual_required = False
     directed = {(int(s), int(d)): float(w) for s, d, w in zip(src, dst, weight)}
     edge_pairs: Dict[Tuple[int, int], Dict[str, float]] = {}
+    candidate_scores: Dict[int, Dict[int, float]] = defaultdict(dict)
 
     for (s, d), w_sd in directed.items():
         if s == d or s == 0 or d == 0:
             continue
-        if mutual_required and (d, s) not in directed:
-            continue
-        if mutual_required:
-            w_ds = directed[(d, s)]
-            cos_sim = max(w_sd, w_ds)
+        has_reverse = (d, s) in directed
+        if mutual_required and not has_reverse:
+            cos_sim = w_sd
+        elif has_reverse:
+            cos_sim = max(w_sd, directed[(d, s)])
         else:
             cos_sim = w_sd
-        u, v = (s, d) if s < d else (d, s)
-        existing = edge_pairs.get((u, v))
-        if existing is None or cos_sim > existing["cos"]:
-            edge_pairs[(u, v)] = {"cos": cos_sim}
 
-    sigma = compute_sigma(raw_distances, num_nodes, args.local_k) if not args.disable_local_scale else None
-
-    for (u, v), data in edge_pairs.items():
-        cos_sim = data["cos"]
-        snn_score = shared_neighbor_score(raw_neighbors[u], raw_neighbors[v], args.snn_metric)
+        snn_score = shared_neighbor_score(raw_neighbors[s], raw_neighbors[d], args.snn_metric)
         blended = (1.0 - args.snn_alpha) * cos_sim + args.snn_alpha * snn_score
-        if sigma is not None:
+
+        sigma = None
+        if not args.disable_local_scale:
+            # compute on demand later; placeholder
+            sigma = True  # mark to compute later
+
+        # store candidate score (will adjust later if local scaling needed)
+        candidate_scores[s][d] = max(candidate_scores[s].get(d, 0.0), blended)
+        candidate_scores[d][s] = max(candidate_scores[d].get(s, 0.0), blended)
+
+    sigma_values = compute_sigma(raw_distances, num_nodes, args.local_k) if not args.disable_local_scale else None
+
+    for (s, d), _ in directed.items():
+        if s == d or s == 0 or d == 0:
+            continue
+        if args.disable_local_scale:
+            final_score = candidate_scores[s][d]
+        else:
+            cos_sim = max(directed[(s, d)], directed.get((d, s), directed[(s, d)]))
             dist = max(0.0, 1.0 - cos_sim)
-            loc = math.exp(- (dist ** 2) / (sigma[u] * sigma[v] + 1e-8))
-            blended = args.local_beta * blended + (1.0 - args.local_beta) * loc
+            loc = math.exp(- (dist ** 2) / (sigma_values[s] * sigma_values[d] + 1e-8))
+            snn_blended = candidate_scores[s][d]
+            final_score = args.local_beta * snn_blended + (1.0 - args.local_beta) * loc
+            candidate_scores[s][d] = final_score
+            candidate_scores[d][s] = final_score
+
+    for (s, d), score in directed.items():
+        if s == d or s == 0 or d == 0:
+            continue
+        if mutual_required and (d, s) not in directed:
+            continue
+        u, v = (s, d) if s < d else (d, s)
+
+        blended = candidate_scores[s][d]
 
         if modality == "category" and args.hub_penalty_exp > 0:
             deg_u = max(1, len(raw_neighbors[u]))
@@ -212,11 +244,13 @@ def apply_pipeline(
             penalty = (deg_u ** (-args.hub_penalty_exp)) * (deg_v ** (-args.hub_penalty_exp))
             blended *= penalty
 
-        data["weight"] = blended
+        existing = edge_pairs.get((u, v))
+        if existing is None or blended > existing["weight"]:
+            edge_pairs[(u, v)] = {"weight": blended}
 
     # Drop edges below threshold
     edge_pairs = {k: v["weight"] for k, v in edge_pairs.items() if v["weight"] >= args.min_weight}
-    return edge_pairs
+    return edge_pairs, candidate_scores
 
 
 def select_topk_per_node(
@@ -224,24 +258,16 @@ def select_topk_per_node(
     edge_pairs: Dict[Tuple[int, int], float],
     final_k: int,
 ) -> Dict[Tuple[int, int], float]:
-    per_node: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
-    for (u, v), w in edge_pairs.items():
-        per_node[u].append((v, w))
-        per_node[v].append((u, w))
-
+    if final_k is None or final_k <= 0:
+        return dict(edge_pairs)
+    degree = [0] * num_nodes
     selected: Dict[Tuple[int, int], float] = {}
-    for node in range(1, num_nodes):
-        neighs = per_node.get(node, [])
-        if not neighs:
+    for (u, v), w in sorted(edge_pairs.items(), key=lambda item: item[1], reverse=True):
+        if degree[u] >= final_k or degree[v] >= final_k:
             continue
-        neighs.sort(key=lambda x: x[1], reverse=True)
-        limit = final_k if final_k > 0 else len(neighs)
-        for v, w in neighs[:limit]:
-            if node == v:
-                continue
-            key = (node, v) if node < v else (v, node)
-            if key not in selected or w > selected[key]:
-                selected[key] = w
+        selected[(u, v)] = w
+        degree[u] += 1
+        degree[v] += 1
     return selected
 
 
@@ -268,8 +294,49 @@ def rescale_weights(edge_pairs: Dict[Tuple[int, int], float]) -> Dict[Tuple[int,
     return {k: (w - w_min) / (w_max - w_min) for k, w in edge_pairs.items()}
 
 
+def ensure_category_min_degree(edge_pairs: Dict[Tuple[int, int], float],
+                               candidate_scores: Dict[int, Dict[int, float]],
+                               num_nodes: int,
+                               min_degree: int,
+                               final_k: int) -> Dict[Tuple[int, int], float]:
+    if min_degree <= 0:
+        return edge_pairs
+    current = defaultdict(int)
+    for (u, v) in edge_pairs.keys():
+        current[u] += 1
+        current[v] += 1
+
+    updated = dict(edge_pairs)
+
+    for node in range(1, num_nodes):
+        needed = min_degree - current.get(node, 0)
+        if needed <= 0:
+            continue
+        candidates = candidate_scores.get(node, {})
+        if not candidates:
+            continue
+        sorted_candidates = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)
+        for neighbor, score in sorted_candidates:
+            if neighbor == node:
+                continue
+            if current.get(node, 0) >= final_k:
+                break
+            if current.get(neighbor, 0) >= final_k:
+                continue
+            key = (node, neighbor) if node < neighbor else (neighbor, node)
+            if key in updated:
+                continue
+            updated[key] = score + 1.0  # boost to keep during selection
+            current[node] = current.get(node, 0) + 1
+            current[neighbor] = current.get(neighbor, 0) + 1
+            needed -= 1
+            if needed <= 0:
+                break
+    return updated
+
+
 def _apply_caps(edges: List[Tuple[int, int, int, float]], num_nodes_including_padding: int,
-                cap_per_rel: int | None, cap_total: int | None) -> Tuple[List[Tuple[int, int, int, float]], Dict[int, int], int]:
+                cap_per_rel: Optional[int], cap_total: Optional[int]) -> Tuple[List[Tuple[int, int, int, float]], Dict[int, int], int]:
     if cap_per_rel is None and cap_total is None:
         return edges, {}, 0
 
@@ -280,7 +347,7 @@ def _apply_caps(edges: List[Tuple[int, int, int, float]], num_nodes_including_pa
     per_rel_dropped: Dict[int, int] = {}
     kept_edges: List[Tuple[int, int, int, float]] = []
 
-    def greedy_cap(edge_list: List[Tuple[int, int, int, float]], cap: int | None) -> Tuple[List[Tuple[int, int, int, float]], int]:
+    def greedy_cap(edge_list: List[Tuple[int, int, int, float]], cap: Optional[int]) -> Tuple[List[Tuple[int, int, int, float]], int]:
         if cap is None:
             return edge_list, 0
         deg = np.zeros(num_nodes_including_padding, dtype=np.int64)
@@ -342,17 +409,31 @@ def build_unified_graph(
     root: Path,
     dataset: str,
     modalities: Sequence[str],
-    cap_per_rel: int | None,
-    cap_total: int | None,
+    cap_per_rel: Optional[int],
+    cap_total: Optional[int],
     output_path: Path,
 ) -> None:
     relation_map = {mod: idx for idx, mod in enumerate(modalities)}
     combined: Dict[Tuple[int, int, int], float] = {}
-    num_nodes_with_pad: int | None = None
+    num_nodes_with_pad: Optional[int] = None
     embedding_dims: Dict[str, int] = {}
 
     for mod in modalities:
-        graph_path = root / 'datasets' / dataset / 'global_graph' / f'global_graph_{mod}_knn.pkl'
+        base_dir = root / 'datasets' / dataset / 'global_graph'
+        candidates = [
+            base_dir / f'global_graph_{mod}_knn.pkl',
+            base_dir / f'global_graph_{mod}.pkl',
+        ]
+        # Special-case shared naming if mod already includes suffix
+        if not mod.endswith("_knn"):
+            candidates.append(base_dir / f'global_graph_{mod}_shared.pkl')
+        graph_path = None
+        for cand in candidates:
+            if cand.exists():
+                graph_path = cand
+                break
+        if graph_path is None:
+            raise FileNotFoundError(f"Modality graph not found for '{mod}'. Looked in: {candidates}")
         if not graph_path.exists():
             raise FileNotFoundError(f"Modality graph not found for '{mod}': {graph_path}")
         graph = load_pickle(graph_path)
@@ -447,7 +528,7 @@ def build_graph(root: Path, dataset: str, modality: str, args: argparse.Namespac
         raw_neighbors[int(s)].add(int(d))
         raw_distances[int(s)].append(float(1.0 - w))
 
-    edge_pairs = apply_pipeline(
+    edge_pairs, candidate_scores = apply_pipeline(
         num_nodes_including_padding,
         modality,
         src,
@@ -459,6 +540,16 @@ def build_graph(root: Path, dataset: str, modality: str, args: argparse.Namespac
     )
 
     final_k = args.final_k if args.final_k is not None else DEFAULT_FINAL_K.get(modality, 40)
+
+    if modality == "category" and args.cat_min_degree > 0:
+        edge_pairs = ensure_category_min_degree(
+            edge_pairs,
+            candidate_scores,
+            num_nodes_including_padding,
+            min_degree=args.cat_min_degree,
+            final_k=final_k,
+        )
+
     selected_pairs = select_topk_per_node(num_nodes_including_padding, edge_pairs, final_k)
 
     if not args.disable_degree_norm:
@@ -522,8 +613,23 @@ def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parent
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    output_path = ensure_output_path(root, args.dataset, args.modality, args.output)
-    build_graph(root, args.dataset, args.modality, args, device, output_path)
+    if args.mode == 'single':
+        output_path = ensure_output_path(root, args.dataset, args.modality, args.output)
+        build_graph(root, args.dataset, args.modality, args, device, output_path)
+    else:
+        modalities = [m.strip() for m in args.modalities.split(',') if m.strip()]
+        if not modalities:
+            raise ValueError("No modalities provided for unified mode.")
+        output_path = Path(args.output) if args.output else root / 'datasets' / args.dataset / 'global_graph' / 'global_graph_unified.pkl'
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        build_unified_graph(
+            root=root,
+            dataset=args.dataset,
+            modalities=modalities,
+            cap_per_rel=args.cap_out_per_rel,
+            cap_total=args.cap_total,
+            output_path=output_path,
+        )
 
 
 if __name__ == '__main__':
